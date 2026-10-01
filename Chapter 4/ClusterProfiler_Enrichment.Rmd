@@ -1,0 +1,186 @@
+---
+title: "Clustering_Enrichment"
+author: "Yuanjun Gu"
+date: "2026-01-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# basic packages
+library(tidyverse)
+library(data.table)
+library(patchwork)
+```
+```{r Clusterprofiler setup}
+# gene enrichment
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+```
+
+# Run GO enrichment: MRI Modality vs GO:BP Over-representation
+```{r read in and format data}
+FLAMES_gene_results = fread("SF8_FLAMES_gene_prioritisation_results.txt")
+
+FLAMES_gene_results.f = FLAMES_gene_results %>%
+  mutate(
+    family = case_when(
+      MRI_pheno %in% c("SA","GMV","FI","IC") ~ "Macrostructural Morphology",
+      MRI_pheno %in% c("FA","ICVF") ~ "White Matter Integrity",
+      MRI_pheno %in% c("GC","MC") ~ "Cortical Geometry",
+      MRI_pheno %in% c("MD","ISOVF") ~ "Water Diffusivity",
+      MRI_pheno == "CT" ~ "Cortical Thickness",
+      MRI_pheno == "OD" ~ "Orientation Dispersion",
+      MRI_pheno == "Vol" &
+        region %in% c("choroid.plexus", "CSF", "Optic.Chiasm",
+                      "3rd.Ventricle", "4th.Ventricle", "Inf.Lat.Vent") ~ "Water Diffusivity",
+      MRI_pheno == "Vol" &
+        !region %in% c("choroid.plexus", "CSF", "Optic.Chiasm", 
+                       "3rd.Ventricle", "4th.Ventricle", "Inf.Lat.Vent") ~ "Macrostructural Morphology",
+      TRUE ~ NA_character_))
+```
+```{r GO:BP Enrichment by family}
+GO_results = lapply(split(FLAMES_gene_results.f$ensg, FLAMES_gene_results.f$family),
+                    function(genes) {
+                      enrichGO(
+                        gene = unique(genes),
+                        OrgDb = org.Hs.eg.db,
+                        keyType = "ENSEMBL",
+                        ont = "BP",
+                        pAdjustMethod = "BH") %>%
+                        
+                        simplify(cutoff = 0.7, by = "p.adjust", select_fun = min)})
+
+saveRDS(GO_results, "Clusterprofiler_Family_GO_results.Rds")
+```
+```{r MRI Modality Family GO:BP Enrichment Visualisation: Most significant}
+go_table = map_dfr(names(GO_results),function(fam) {as.data.frame(GO_results[[fam]]) %>% mutate(family = fam)})
+
+# get top significant families
+go_top10 = go_table %>% 
+  filter(p.adjust < 0.05) %>%
+  group_by(family) %>%
+  slice_min(order_by = p.adjust, n = 10, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(family, p.adjust)
+
+go_top10.f = go_top10 %>% 
+  mutate(
+    # GO:Category
+    GO_group = case_when(
+      str_detect(Description,
+        "axon|neuron projection|neurogenesis|forebrain|telencephalon|
+         nervous system|motor neuron|CNS neuron|axonogenesis|
+        nervous system development|central nervous system neuron differentiation") ~ "Neurodevelopment",
+      
+      str_detect(Description,
+        "Wnt|JNK|PI3K|AKT|phosphatidylinositol|tyrosine phosphorylation|receptor") ~ "Signalling Pathways",
+
+      str_detect(Description,
+        "morphogenesis|developmental growth|regionalization|differentiation|cell growth|limb|cell fate") ~ "Morphogenesis & Differentiation",
+      
+      str_detect(Description,
+        "migration|locomotion|cell projection organization|projection development") ~ "Cell Migration & Projection Dynamics",
+      
+      str_detect(Description, "development") ~ "Organ Development",
+      str_detect(Description, "hemostasis|coagulation") ~ "Hemostatic Processes"),
+    # GO:Category Rank
+    GO_group_cat = factor(GO_group, levels = c("Neurodevelopment", "Signalling Pathways", "Morphogenesis & Differentiation",
+                                           "Cell Migration & Projection Dynamics", "Organ Development","Hemostatic Processes"), 
+                      labels = LETTERS[1:6]),
+    # Abbreviation
+    Description = gsub("positive regulation of phosphatidylinositol 3-kinase/protein kinase B signal transduction", 
+                         "Positive regulation of PI3K-AKT signalling", Description)) %>%
+  select(ID, Description, GO_group, GO_group_cat, family, FoldEnrichment, p.adjust) %>%
+  mutate(end_phrase = stringr::word(Description, -1))
+
+# Set Description order
+go_top10.f$Description = factor(go_top10.f$Description, levels = rev(unique(go_top10.f$Description[order(go_top10.f$end_phrase,
+                                                                                                         nchar(go_top10.f$Description))])))
+# plot F4.3.8A
+F4.3.8A = ggplot(go_top10.f, aes(x = family, y = Description, size = FoldEnrichment, colour = -log10(p.adjust))) +
+  geom_point() +
+  scale_colour_gradientn(colours = c("black", "purple", "coral"), limits = c(0, 14)) +
+  facet_grid(GO_group_cat ~ ., scales = "free_y", space = "free_y") +
+  theme_bw() +
+  labs(x = NULL, y = NULL, colour = "-log(p_FDR)", size = "Fold enrichment") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r MRI Modality Family GO:BP Enrichment Visualisation: Most Pleitropic}
+# Find groups that are most shared across family, most enriched and most significant overall
+go_shared_top20 = go_table %>%
+  filter(p.adjust < 0.05, ID %in% (
+    go_table %>% 
+      filter(p.adjust < 0.05) %>%
+      group_by(ID, Description) %>%
+      summarise(
+        n_families = n_distinct(family),
+        mean_enrichment = mean(FoldEnrichment),
+        mean_sig = mean(-log10(p.adjust)),
+        .groups = "drop") %>%
+        arrange(desc(n_families), desc(mean_enrichment), desc(mean_sig)) %>%
+        slice_head(n = 20) %>%
+        pull(ID)))
+
+go_shared_top20.f = go_shared_top20 %>% 
+  mutate(
+    # GO:Category
+    GO_group = case_when(
+      str_detect(Description,
+        "axon|neuron projection|neurogenesis|forebrain|telencephalon|
+         nervous system|motor neuron|CNS neuron|axonogenesis|gliogenesis|
+        nervous system development|central nervous system neuron differentiation|regulation of neuron differentiation") ~ "Neurodevelopment",
+      
+      str_detect(Description,
+        "Wnt|JNK|PI3K|AKT|phosphatidylinositol|tyrosine phosphorylation|receptor|Rho protein signal transduction") ~ "Signalling Pathways",
+
+      str_detect(Description,
+        "morphogenesis|developmental growth|regionalization|differentiation|cell growth|limb|cell fate") ~ "Morphogenesis & Differentiation",
+      
+      str_detect(Description,
+        "migration|locomotion|cell projection organization|
+        projection development|cell-substrate junction organization") ~ "Cell Migration & Projection Dynamics",
+      
+      str_detect(Description, "development|organ growth") ~ "Organ Development",
+      str_detect(Description, "hemostasis|coagulation") ~ "Hemostatic Processes"),
+    # GO:Category Rank
+    GO_group_cat = factor(GO_group, levels = c("Neurodevelopment", "Signalling Pathways", "Morphogenesis & Differentiation",
+                                           "Cell Migration & Projection Dynamics", "Organ Development","Hemostatic Processes"), 
+                      labels = LETTERS[1:6]),
+    # Abbreviation
+    Description = gsub("positive regulation of phosphatidylinositol 3-kinase/protein kinase B signal transduction", 
+                         "Positive regulation of PI3K-AKT signalling", Description)) %>%
+  select(ID, Description, GO_group, GO_group_cat, family, FoldEnrichment, p.adjust) %>%
+  mutate(end_phrase = stringr::word(Description, -1))
+
+# Set Description order
+go_shared_top20.f$Description = factor(go_shared_top20.f$Description, levels = rev(unique(
+  go_shared_top20.f$Description[order(go_shared_top20.f$end_phrase,nchar(go_shared_top20.f$Description))])))
+
+# plot F4.3.8B
+F4.3.8B = ggplot(go_shared_top20.f, aes(x = family, y = Description, size = FoldEnrichment, colour = -log10(p.adjust))) +
+  geom_point() +
+  scale_colour_gradientn(colours = c("black", "purple", "coral"), limits = c(0, 14)) +
+  facet_grid(GO_group_cat ~ ., scales = "free_y", space = "free_y") +
+  theme_bw() +
+  labs(x = NULL, y = NULL, colour = "-log(p_FDR)", size = "Fold enrichment") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r F4.3.8 Construction}
+# set unify size sclae
+size_scale = scale_size_continuous(name = "Fold enrichment", limits = range(go_table$FoldEnrichment, na.rm = TRUE))
+
+F4.3.8A.plot = F4.3.8A + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) + size_scale
+F4.3.8B.plot = F4.3.8B + size_scale
+
+F4.3.8 = (F4.3.8A.plot / F4.3.8B.plot) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom")
+
+ggsave("F4.3.8_GO_enrichment.png", F4.3.8, 
+       width = 10, height = 16, dpi = 600)
+
+ggsave("F4.3.8_GO_enrichment.pdf", F4.3.8, 
+       width = 10, height = 16, dpi = 600)
+```

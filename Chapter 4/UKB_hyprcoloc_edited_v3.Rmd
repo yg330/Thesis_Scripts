@@ -1,0 +1,345 @@
+# Library set up
+```{r setup}
+# packages for data processing
+library(readxl)
+library(tidyverse)
+library(data.table)
+
+# packages for colocalisation analysis
+library(RcppEigen) # Note. Do not update from 0.3.3.9.3, otherwise will prevent hyprcoloc from installing/running!!!
+library(hyprcoloc)
+library(coloc) # alternative coloc methods for sensitivity analysis
+
+# package for UpSet Graph
+library(ComplexUpset) # For figure generations, alternatively you can use ComplexHeatmap?
+```
+# hyprcoloc
+```{r hyprcoloc package viniette, eval=FALSE, include=FALSE}
+betas <- hyprcoloc::test.betas # shows that it requires matrix instead of data.table or data.frame data type to run.
+head(betas)
+ses <- hyprcoloc::test.ses
+head(ses)
+
+# Trait names and SNP IDs
+traits <- paste0("T", 1:10)
+rsid <- rownames(betas)
+
+# Colocalization analysis
+hyprcoloc(betas, ses, trait.names = traits, snp.id = rsid) # default argument set uniform.priors as FALSE, no need to further add any arguments
+```
+```{r find LD Blocks to scan for colocolisations, eval=FALSE, include=FALSE}
+input_dir <- "~/rds/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/UKB_manhattan"
+out_dir <- "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/"
+
+p_threshold <- 4.65e-11 # make EWS
+
+# Load LD blocks: downloaded from mapgen package here - https://github.com/xinhe-lab/mapgen/blob/main/inst/extdata/LD.blocks.EUR.hg19.rds
+# They're generated from:  1000 Genomes (1KG) European population (in hg19)
+# !! Note. Only autosomal regions are considered !!
+
+LD_Blocks <- readRDS("/rds/user/yg330/hpc-work/pgs_img_2/Rscript/LD.blocks.EUR.hg19.rds") %>%
+  mutate(
+    chr = as.integer(chr),
+    start = as.integer(start),
+    end = as.integer(end)
+  )
+
+# Process each GWAS file
+files <- list.files(input_dir, pattern = ".txt", full.names = TRUE)
+
+all_sig_snps <- map_dfr(files, function(filepath) {
+  filename <- gsub("combined_GWAS_|STR_|DTI_|_avg_scaled|.p_1e_03.txt","", basename(filepath))
+  cat("Processing", filename, "...\n")
+  
+  fread(filepath, select = c("SNP", "CHR", "POS", "P"), data.table = FALSE) %>%
+    mutate(
+      CHR = as.integer(CHR),
+      POS = as.integer(POS),
+      GWAS_list = filename
+    ) %>%
+    filter(P <= p_threshold)
+}) %>% group_by(SNP) %>%
+  summarise(
+    CHR = first(CHR),
+    POS = first(POS),
+    n_traits = n_distinct(GWAS_list),
+    GWAS_list = paste(unique(GWAS_list), collapse = ","),
+    .groups = "drop"
+  )
+
+all_sig_snps_LD_blocks <- all_sig_snps %>%
+  left_join(
+    LD_Blocks,
+    by = c("CHR" = "chr"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(POS >= start, POS <= end) %>%
+  group_by(locus) %>%
+  mutate(
+    GWAS_list = paste(unique(unlist(strsplit(GWAS_list, ","))), collapse = ","),
+    n_traits = length(unique(unlist(strsplit(GWAS_list, ","))))
+  ) %>%
+  ungroup() %>%
+  distinct(locus, .keep_all = TRUE) %>%
+  rename("chr" = "CHR") %>% 
+  select(all_of(names(LD_Blocks)), GWAS_list, n_traits)
+
+write.table(all_sig_snps_LD_blocks, paste0(out_dir, "GWAS_coloc_LD_block_list_v2.txt"), row.names = F, quote = F)
+```
+```{r find se and beta for relevant locus, eval=FALSE, include=FALSE}
+source("/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/hyprcoloc_munge.R")
+
+# input: GWAS_path (a table that had all MRI GWAS's path), GWAS_loci (coloc_LD_block_list, a table with what GWAS is sig.associated with what locus)
+# output: BE and SE table with all SNPs exist within the locus from all GWAS with sig.signal associate with it. 
+
+# Additionally, you can instead couple hyprcoloc_munge_slurm.R with slurm hpc to make the process faster through parcellation - hyprcoloc_munge.sh
+```
+```{r Source Code for: find se and beta for relevant locus if .R file is missing, eval=FALSE, include=FALSE}
+# Note. use hyprcoloc_munge_slurm.R and hyprcoloc_munge.sh if you need to generate a large batch of it.
+
+library(tidyverse)
+library(data.table)
+
+GWAS_path <- fread("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/supplement_results/All_post_GWAS_file_path.txt",
+                   select = c("GWAS_name", "UKB_all_path"))
+GWAS_loci <- fread("/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/GWAS_coloc_LD_block_list_v2.txt")
+out_dir <- "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/munged_hyprcoloc_files/"
+
+# reformat so files can be all found
+GWAS_loci$GWAS_list = gsub("_r", ".r", GWAS_loci$GWAS_list, ignore.case = FALSE)
+GWAS_loci$GWAS_list = gsub("_l", ".l", GWAS_loci$GWAS_list, ignore.case = FALSE)
+GWAS_loci$GWAS_list = gsub("X", "", GWAS_loci$GWAS_list, ignore.case = FALSE)
+GWAS_loci$GWAS_list = gsub("CC_", "CC.", GWAS_loci$GWAS_list, ignore.case = FALSE)
+GWAS_loci$GWAS_list = gsub("Mid_", "Mid.", GWAS_loci$GWAS_list, ignore.case = FALSE)
+
+# remove rows with only 1 traits
+GWAS_loci.f = GWAS_loci %>% filter(n_traits > 1)
+
+# Get Beta and SE from relevant GWAS for each LD loci block
+for(n in seq_len(nrow(GWAS_loci.f))) {
+  current_locus <- GWAS_loci.f[[n, "locus"]]
+  current_chr <- GWAS_loci.f[[n, "chr"]]
+  current_start <- GWAS_loci.f[[n, "start"]]
+  current_end <- GWAS_loci.f[[n, "end"]]
+  current_GWAS_list <- str_split(GWAS_loci.f[[n, "GWAS_list"]], pattern = ",")[[1]]
+  current_n_traits <- GWAS_loci.f[[n, "n_traits"]]
+  
+  # Filter GWAS_path to get matching rows
+  current_GWAS_path <- drop_na(GWAS_path[match(current_GWAS_list, GWAS_path$GWAS_name), ]) # To not to pick both IC_47e and IC_47 when IC_47 is needed. 
+  
+  if (nrow(current_GWAS_path) != current_n_traits) {
+    stop(paste0("Locus ", current_locus, ": n_traits (", current_n_traits, 
+                ") does not match GWAS_list length (", length(current_GWAS_list), ")"))
+  }
+  
+  # Read all matching GWAS files into a list
+  GWAS_data_list <- map2(
+    current_GWAS_path$UKB_all_path, current_GWAS_path$GWAS_name, 
+    function(filepath, trait_name) {
+      temp_file <- tempfile(tmpdir = "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/test")
+      
+      # Pre-filtering through awk: column 1 = CHR, column 3 = POS
+      system(paste0(
+        "awk 'NR==1 {print; next} $1==", current_chr, " && $3>=", current_start, " && $3<=", current_end, " {print}' ",
+        filepath, " > ", temp_file))
+      
+      result <- fread(temp_file, select = c("SNP", "BETA", "SE")) %>%
+        rename(
+          !!paste0(trait_name, "_BETA") := BETA,
+          !!paste0(trait_name, "_SE") := SE)
+      
+      file.remove(temp_file)
+      result
+    })
+  
+  # Combine all dataframes by SNP
+  GWAS_combined <- reduce(GWAS_data_list, full_join, by = "SNP")
+  
+  # Extract beta
+  current_beta <- GWAS_combined %>%
+    select(SNP, ends_with("_BETA")) %>%
+    rename_with(~str_remove(., "_BETA"), ends_with("_BETA")) %>%
+    column_to_rownames("SNP")
+  
+  # Extract SE
+  current_se <- GWAS_combined %>%
+    select(SNP, ends_with("_SE")) %>%
+    rename_with(~str_remove(., "_SE"), ends_with("_SE")) %>%
+    column_to_rownames("SNP")
+  
+  # write results
+  write.table(current_beta, file = paste0(out_dir, "LD_id_", current_locus, "_beta.txt"), quote = FALSE)
+  write.table(current_se, file = paste0(out_dir, "LD_id_", current_locus, "_se.txt"), quote = FALSE)
+}
+```
+```{r generate hyprcoloc results, eval=FALSE, include=FALSE}
+input_dir = "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/munged_hyprcoloc_files/"
+out_dir <- "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/hyprcoloc_result/"
+
+# Run hyprcoloc
+beta_files = list.files(input_dir, pattern = "_beta", full.names = TRUE)
+
+# !! skip LD_id_1510 as it's the LD block with 800 traits co-localising together, and thus requires hpc-based solution. !!
+beta_files = beta_files[beta_files != "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/munged_hyprcoloc_files//LD_id_1510_beta.txt"]
+
+for (beta_file in beta_files) {
+  current_locus_id = basename(gsub("_beta.txt", "",beta_file))
+  message(paste("Processing ", current_locus_id))
+  
+  se_pattern = paste0(current_locus_id, "_se.txt")
+  se_file = list.files(input_dir, pattern = se_pattern, full.names = TRUE)
+  
+  # Check if the corresponding SE file exists
+  if (!file.exists(se_file) | length(se_file) != 1) {
+    message(paste("Error: Missing SE file for", current_locus_id))
+    next
+  }
+  
+  # Format for hyprcoloc input
+  beta_mat = as.matrix(read.table(beta_file, header = TRUE, row.names = 1) %>% drop_na())
+  se_mat = as.matrix(read.table(se_file, header = TRUE, row.names = 1) %>% drop_na())
+  SNP.list = row.names(beta_mat)
+  Trait.list = colnames(beta_mat)
+  
+  if (!all(SNP.list == row.names(se_mat) | !all(Trait.list == colnames(se_mat)))) { # Sanity check: ensure SNP and Trait list match
+    stop(paste("Error: SNP or Trait list mismatch in", current_locus_id))
+  }
+  
+  # Run hyprcoloc
+  tryCatch({
+    
+    coloc_result <- hyprcoloc(effect.est = beta_mat, effect.se = se_mat, trait.names = Trait.list, snp.id = SNP.list) # ignore warning as results looked fine
+    result_path = paste0(out_dir, "hyprcoloc_", current_locus_id, ".txt")
+    write.csv(coloc_result$results, file = result_path, row.names = FALSE)}, 
+    
+    error = function(e) {message(paste("Error running hyprcoloc on", current_locus_id, ":", e$message))})
+}
+```
+```{r run hyprcoloc for LD 1510, eval=FALSE, include=FALSE}
+# LD1510 is done in subsets as hyprcoloc for unknown reasons will break when attempt to run (even on slurm, 10GB for 8 hours, see "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/hyprcoloc_for_LD1510_slurm.R" for details). This is weird because hyprcoloc usually process 200+ traits with no problems. However, as what we want to know is a clustered probability, that means by studying the overlapping of the potential subset(s), we could eventually have a good idea what it will look like if it ran.
+
+# Run hyprcoloc in batch
+input_dir = "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/munged_hyprcoloc_files/"
+out_dir <- "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/hyprcoloc_result/hyprcoloc_LD_id_1510/"
+
+LD1510_beta_path = list.files(input_dir, pattern = "LD_id_1510_beta.txt", full.names = TRUE)
+LD1510_se_path = list.files(input_dir, pattern = "LD_id_1510_se.txt", full.names = TRUE)
+
+LD1510_beta_mat = as.matrix(read.table(LD1510_beta_path, header = TRUE, row.names = 1) %>% drop_na())
+LD1510_se_mat = as.matrix(read.table(LD1510_se_path, header = TRUE, row.names = 1) %>% drop_na())
+LD1510_SNP.list = row.names(LD1510_beta_mat)
+LD1510_Trait.list = colnames(LD1510_beta_mat)
+
+# From running batch hyprcoloc of 50 traits at once for the first 50 and the 51 to 100 traits, I found that no traits co-localised to each other.
+# Therefore, I decided to try to find traits that are most likely to co-localise together based on the locus beta/se, and try again.
+
+LD1510_zscore_mat = LD1510_beta_mat / LD1510_se_mat
+LD1510_cor_matrix <- cor(LD1510_zscore_mat, use = "pairwise.complete.obs")
+LD1510_hc <- hclust(as.dist(1 - abs(LD1510_cor_matrix)), method = "ward.D2")
+
+plot(LD1510_hc, labels = FALSE, main = "LD1510 Trait Clustering") # to determine dynamic tree cutting height
+
+LD1510_groups <- cutree(LD1510_hc, h = 0.35)
+LD1510_groups[LD1510_groups %in% names(which(table(LD1510_groups) == 1))] <- max(LD1510_groups) + 1 # merge groups n=1
+
+# Function to run hyprcoloc on subsets
+hyprcoloc_subset <- function(trait_subset, betas, ses, snp.list) {
+  subset_betas <- betas[, trait_subset, drop = FALSE]
+  subset_ses <- ses[, trait_subset, drop = FALSE]
+  
+  result <- tryCatch({
+    hyprcoloc(effect.est = subset_betas, 
+             effect.se = subset_ses, 
+             trait.names = colnames(subset_betas), 
+             snp.id = snp.list)
+  }, error = function(e) {
+    message(paste("Error:", e$message))
+    return(NULL)
+  })
+  
+  return(result)
+}
+
+# Run hyprcoloc for each group
+for(g in unique(LD1510_groups)) {
+  trait_subset <- which(LD1510_groups == g)
+  
+  if(length(trait_subset) > 100) {
+    sub_starts <- seq(1, length(trait_subset), by = 100)
+    
+    for(s in sub_starts) {
+      sub_end <- min(s + 100 - 1, length(trait_subset))
+      sub_subset <- trait_subset[s:sub_end]
+      
+      cat(sprintf("Testing correlation group %d, subset %d-%d...\n", g, s, sub_end))
+      result <- hyprcoloc_subset(sub_subset, LD1510_beta_mat, LD1510_se_mat, LD1510_SNP.list)
+      
+      if(!is.null(result)) {
+        result_path = paste0(out_dir, "LD1510_group_", g, "_subset_", s, "_to_", sub_end, ".txt")
+        write.csv(result$results, result_path, row.names = FALSE)
+      }
+    }
+  } else {
+    cat(sprintf("Testing correlation group %d...\n", g))
+    result <- hyprcoloc_subset(trait_subset, LD1510_beta_mat, LD1510_se_mat, LD1510_SNP.list)
+    
+    if(!is.null(result)) {
+      result_path = paste0(out_dir, "LD1510_group_", g, ".txt")
+      write.csv(result$results, result_path, row.names = FALSE)
+    }
+  }
+}
+```
+```{r futher investigation of LD1510 to try to recover as much potential groupings as possible, eval=FALSE, include=FALSE}
+# Form mastertable for LD1510 to find initial co-localisation structure
+LD1510_hyprcoloc = reduce(lapply(list.files(out_dir, pattern = "LD1510_group_", full.names = TRUE), function(file) {
+  fread(file)[, subset_id :=  basename(gsub("hyprcoloc_|LD1510_group_|.txt", "",file))]
+}), rbind)
+
+# As see, we got suggestions of groupings, as clusteres forming. Then we try to investigate if we can merge the groups further, and see if any dropped traits can also join back to a group.
+
+LD1510_hyprcoloc.na = LD1510_hyprcoloc %>% filter(traits == "None")
+unique_pairs = t(combn(unique(LD1510_hyprcoloc.na$subset_id), 2)) # find unique pairings to see if dropped traits can form any additional groups
+
+for (i in 1:nrow(unique_pairs)) {
+  subset_1 <- unique_pairs[i, 1]
+  subset_2 <- unique_pairs[i, 2]
+  
+  current_subset_dropped_traits = LD1510_hyprcoloc %>% filter(subset_id %in% c(subset_1, subset_2), traits == "None")
+  dropped_traits.list = unlist(strsplit(current_subset_dropped_traits$dropped_trait, ",\\s*"))
+  result_path = paste0(out_dir, "LD1510_drop_merge_", subset_1, "_", subset_2, ".txt")
+  
+  if (!file.exists(result_path)) {
+    cat(sprintf("Testing correlation group %s and %s...\n", subset_1, subset_2))
+    result = hyprcoloc_subset(dropped_traits.list, LD1510_beta_mat, LD1510_se_mat, LD1510_SNP.list)
+    write.csv(result$results, result_path, row.names = FALSE)
+  }
+}
+
+LD1510_hyprcoloc_drop_merge = reduce(lapply(list.files(out_dir, pattern = "LD1510_drop_merge_", full.names = TRUE), function(file) {
+  fread(file)[, subset_id :=  basename(gsub("hyprcoloc_|LD1510_drop_merge_|.txt", "",file))]
+}), rbind)
+LD1510_hyprcoloc_drop_merge.grouped = LD1510_hyprcoloc_drop_merge %>% filter(traits != "None")
+
+LD1510_hyprcoloc_all.grouped = rbind(LD1510_hyprcoloc %>% filter(traits != "None"),LD1510_hyprcoloc_drop_merge.grouped)
+grouped_traits.list = unique(unlist(strsplit(LD1510_hyprcoloc_all.grouped$traits, ",\\s*")))
+write_lines(grouped_traits.list, paste0(out_dir, "/", "LD1510_grouped_trait_list.txt")) # send this trait list to hpc: hyprcoloc_for_LD1510_slurm_groupd.R
+```
+```{r format results into master tables, eval=FALSE, include=FALSE}
+out_dir = "/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/hyprcoloc_result"
+hyprcoloc_results = list.files(out_dir, pattern = ".txt", full.names = TRUE, include.dirs = FALSE)
+hyprcoloc_LD1510_results = list.files(out_dir, pattern = "LD1510_master_result.txt", full.names = TRUE, recursive = TRUE)
+hyprcoloc_results = c(hyprcoloc_results, hyprcoloc_LD1510_results)
+ 
+# Read and combine all files
+hyprcoloc_df <- reduce(lapply(hyprcoloc_results, function(file) {
+  fread(file)[, locus_id :=  basename(gsub("hyprcoloc_|LD|_id_|_master_result|.txt", "",file))]
+}), rbind)
+
+hyprcoloc_df.filtered.PP95 = filter(hyprcoloc_df, !is.na(traits) & traits != "None" & posterior_prob>0.95)
+
+# Write all results
+sup_result_path = "/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/supplement_results/"
+write.table(hyprcoloc_df.filtered.PP95, paste0(sup_result_path, "hyprcoloc_95creditset_v2.txt"), row.names = FALSE)
+write.csv(hyprcoloc_df, paste0(sup_result_path, "STX_hyprcoloc_all_v2.txt"), row.names = FALSE)
+```

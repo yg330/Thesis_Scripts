@@ -1,0 +1,673 @@
+# library
+```{r setup}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+
+# For code reproducibility: and git
+library(here) # project-based relative path finding 
+library(usethis) # git set-up
+
+# For data manipulation
+library(tidyverse)
+library(data.table, include.only = "fread")
+
+# For specific parts of the code
+library(Hmisc, include.only = "hist.data.frame") # For quick visualisation of distribution
+```
+
+# Imaging Data preprocessing
+```{r customised functions for imaging pre-processing}
+# Function for reading, standardising and removing sd outliers for UKB:
+
+UKB_img_read <- function(file_path, file_name, threshold = 5) {
+  # file_path should be a list of file paths
+  # file_name should be a list of names that you want the read data to be assigned as
+  # default outlier threshold is 5, where we define outlier as |data_standardised| > 5*SD, where SD is 1 after standardisation
+  
+  for (i in seq_along(file_path)) {
+    # Read and process tract data
+    tmp_file <- read.csv(file_path[i])
+    tmp_file_name <- file_name[i]
+    
+    # format for GWAS
+    tmp_file$Subject = as.numeric(gsub("UKB", "", tmp_file$Subject))
+    tmp_file = tmp_file %>% rename(FID = Subject) %>% mutate(IID = FID) %>% relocate(FID, IID) # rename Subject to FID -> duplicate FID as IID -> move to correct order.
+    
+    # find non_ID_col index number
+    non_ID_col = which(!colnames(tmp_file) %in% c("FID", "IID"))
+    
+    # Z-score standardisation on numerical columns: set mean = 0 and SD = 1
+    tmp_file[, non_ID_col] <- scale(tmp_file[, non_ID_col])
+  
+    # Remove z-score outliers (beyond ±5 SD)
+    tmp_file <- tmp_file %>% mutate(across(all_of(colnames(tmp_file)[non_ID_col]), ~ replace(., abs(.) > threshold, NA)))
+  
+    # save standardised result table
+    assign(tmp_file_name, tmp_file, envir = .GlobalEnv) # ensure the dataset appears in your global environment
+}}
+
+
+
+
+
+# Function for mad_removal for UKB:
+
+UKB_img_mad_removal <- function(file_name, threshold = 5){
+  # file_name can be a string or a list of names that is associate with the UKB dataset you have and formatted by UKB_img_read()
+  # Default outlier threshold is 5, where we define the outlier as |(col_data - col_median)/col_MAD_adj| > 5, where col_MAD_adj is MAD * 1.4826 assuming data is normally distributed
+
+  # Create outlier_stat table to fill
+  outlier_stat = data.frame(phenotype = character(), region = character(), outlier_Count = integer(), outlier_Rows = character())
+  
+  for (i in seq_along(file_name)){
+    # Read dataset
+    tmp_data = get(file_name[i])
+    
+    # Find non_ID_col index number
+    non_ID_col = which(!colnames(tmp_data) %in% c("FID", "IID"))
+    
+    # MAD outlier removal per column in tmp_data:
+    for (j in non_ID_col) {
+      # Find current column and column name
+      col_name = colnames(tmp_data)[j]
+      current_col = tmp_data[[col_name]]
+      
+      # find median and MAD value
+      col_median = median(current_col, na.rm = TRUE)
+      col_mad = mad(current_col, na.rm = TRUE, constant = 1.4826) # scaled mad value
+      
+      # Skip processing if MAD is 0
+      if (col_mad == 0) {
+        # inform situation
+        print(sprintf("In %s: Skipping %s as MAD = 0", file_name[i], col_name))
+        
+        # Append to outlier_stat as if data had 0 outliers
+        outlier_stat <- rbind(
+          outlier_stat, 
+          data.frame(phenotype = file_name[i], region = col_name, outlier_Count = 0, outlier_Rows = ""))
+        
+        # Skip to next iteration
+        next}
+      
+      # Else (i.e. col_mad is not 0): Find MAD outlier number and location
+      
+      # Transform data in z-score style to get mad magnitude value
+      mad_scores = abs(current_col - col_median)/col_mad
+      
+      # Find MAD outlier number and location
+      mad_outlier = mad_scores > threshold
+      mad_outlier_n <- sum(mad_outlier, na.rm = TRUE)
+      mad_outlier_rows <- which(mad_outlier)
+      
+      # if we got mad outliers:
+      if (mad_outlier_n > 0) {
+        # inform situation
+        print(sprintf(
+          "In %s: %d MAD outliers detected in %s", 
+          file_name[i], 
+          mad_outlier_n, 
+          col_name))
+        
+        # remove MAD outliers
+        tmp_data[[col_name]][mad_outlier] = NA
+      
+        # Append to the outlier_stat for later visualisation
+        outlier_stat <- rbind(
+          outlier_stat,
+          data.frame(
+          phenotype = file_name[i],
+          region = col_name,
+          outlier_Count = mad_outlier_n,
+          outlier_Rows = paste(mad_outlier_rows, collapse = ",")))} 
+      else {
+        # inform situation
+        print(sprintf(
+          "In %s: No MAD outliers in %s", 
+          file_name[i], 
+          col_name))
+        
+        # Append to the outlier_stat for later visualisation
+        outlier_stat <- rbind(
+          outlier_stat,
+          data.frame(
+            phenotype = file_name[i],
+            region = col_name,
+            outlier_Count = mad_outlier_n,
+            outlier_Rows = paste(mad_outlier_rows, collapse = ",")))}
+      }
+    # Assign mad outlier removal processed data to a new name
+    mad_processed_file_name <- paste0(file_name[i], ".mad")
+    outlier_stat_name = "outlier_stat"
+    assign(mad_processed_file_name, tmp_data, envir = .GlobalEnv) # ensure the dataset appears in your global environment
+    assign(outlier_stat_name, outlier_stat, envir = .GlobalEnv)}}
+
+
+
+
+
+# function: logging processed results
+UKB_img_write_data <- function(file_name, table_folder_path, figure_folder_path=table_folder_path){
+  # file_name = a string or list of names that is associate with your dataset
+  # table_folder_path = folder path you're saving your data in
+    # Example: here("result_supplement/imaging_data_final/")
+  # figure_folder_path = assume it is the same as table_folder_path, but can specify
+  
+  for (i in seq_along(file_name)){
+    # set results path
+    sd.result_path = paste0(table_folder_path, file_name[i], ".sd.QCed.txt")
+    sd.mad.result_path = paste0(table_folder_path, file_name[i], ".sd.mad.QCed.txt")
+    sd.hist_path = paste0(figure_folder_path, file_name[i], ".sd.pdf")
+    sd.mad.hist_path = paste0(figure_folder_path, file_name[i], ".sd.mad.pdf")
+  
+    # get and write respective table
+    sd.result = get(file_name[i])
+    sd.mad.result = get(paste0(file_name[i], ".mad"))
+  
+    write.table(sd.result, file = sd.result_path, row.names = FALSE, col.names = TRUE, quote = FALSE)
+    write.table(sd.mad.result, file = sd.mad.result_path, row.names = FALSE, col.names = TRUE, quote = FALSE)
+  
+    # generate respective histogram
+    pdf(file = sd.hist_path)
+      hist(sd.result)
+    dev.off()
+  
+    pdf(file = sd.mad.hist_path)
+      hist(sd.mad.result)
+    dev.off()
+}}
+
+```
+
+## White matter tract
+```{r White matter tract phenotype data standardisation and outlier removal, eval=FALSE, include=FALSE}
+# Step 1: Find file paths and names
+tract_path = list.files("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/raw data/tracts", full.names = TRUE)
+tract_name = gsub("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/raw data/tracts/|dti_|NODDI_|.csv", "", tract_path) # remove anything fit the patterns
+tract_name = paste0("tract_", tract_name) # add distinction for names
+
+# Step 2: Do standardisation and outlier removal on data
+UKB_img_read(tract_path, tract_name) # read, standardise and format dataset with tract_name(s).
+
+# Step 3: Do mad removal on data
+UKB_img_mad_removal(tract_name) # get dataset with tract_name and do mad outlier removal on all of the columns within.
+
+# Step 4: Write data
+tract_result_path = here("result_supplement/imaging_data_v3/")
+tract_figure_path = here("result_supplement/mad_hist_stat_v3/")
+UKB_img_write_data(tract_name, tract_result_path, tract_figure_path)
+write.table(outlier_stat, file = paste0(here("result_supplement/mad_hist_stat_v3/"), "white_matter_tract.mad_outliers.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE) # white matter tract outlier stat
+```
+## Subcortical volume
+```{r Subcortical volume phenotype data standardisation and outlier removal, eval=FALSE, include=FALSE}
+# Step 1: Select subcortical regions from Amir's dataset
+
+# These data have already gone through standardisation and mean+-5SD outlier removal.
+# For details of how the data is generated and cleaned, please check Amir's Jupyter notebook file named "Cleaning.ipynb" in the imaging data folder.
+
+Amir_data = fread(here("imaging_data/All_IDP_subcortical_Amir.csv"))
+
+Amir_data_selected = Amir_data %>% select("IID", "Lateral.Ventricle", "Inf.Lat.Vent", "Cerebellum.White.Matter", "Cerebellum.Cortex", "Thalamus.Proper", "Caudate", "Putamen", "Pallidum", "Hippocampus", "Amygdala", "Accumbens.area", "VentralDC", "vessel", "choroid.plexus", "X3rd.Ventricle", "X4th.Ventricle", "Brain.Stem", "CSF", "WM.hypointensities", "Optic.Chiasm", "CC_Posterior", "CC_Mid_Posterior", "CC_Central", "CC_Mid_Anterior", "CC_Anterior", "SubCortGrayVol")
+
+Amir_data_selected$FID = Amir_data_selected$IID
+
+write.table(Amir_data_selected, file = here("imaging_data/All_IDP_Amir_subcortical.only.txt"), row.names = F, col.names = T, quote = F)
+
+# format to GWAS-ready format
+subcor = fread(here("imaging_data/All_IDP_Amir_subcortical.only.txt"))
+subcor.formatted = subcor %>% relocate("FID", "IID")
+write.table(subcor.formatted, file = here("imaging_data/subcortical_formatted.txt"), row.names = F, col.names = T, quote = F)
+
+
+# Step 2: Process Median Absolute Deviation (MAD) outliers
+UKB_img_mad_removal("subcor.formatted") # get dataset and do mad outlier removal on all of the columns within.
+
+# Step 3: Write data
+subcor_result_path = here("result_supplement/imaging_data_v3/")
+subcor_figure_path = here("result_supplement/mad_hist_stat_v3/")
+UKB_img_write_data("subcor.formatted", subcor_result_path, subcor_figure_path)
+write.table(outlier_stat, file = paste0(here("result_supplement/mad_hist_stat_v3/"), "subcor.mad_outliers.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE) # outlier stat
+```
+
+## Regional MRI phenotypes: FINALISED
+```{r Regional Phenotype z-score standardisation and outlier Removal, eval=FALSE, include=FALSE}
+# Read Regional MRI phenotype data
+file.loc = list.files(here("imaging_data"), pattern="HCP.*\\.csv", full.names=TRUE)
+file.name = gsub(here("imaging_data/HCP.fsaverage.aparc_|dti_|NODDI_|.csv"), "", file.loc) # remove anything fit the patterns
+
+for (i in seq_along(file.loc)) { # for loop to read in all MRI phenotypes
+  tmp_file = fread(file.loc[i])
+  assign(file.name[i], tmp_file)
+}
+
+# List region names that will need to generate average regional values
+region.names = grep("ROI", colnames(tmp_file), value = TRUE)
+region.names = unique(gsub("lh_L_|rh_R_|_ROI", "", region.names))
+
+# Special For loop for generating averaged region scores and z-score standardisation and outlier removal as it is not easy to be implemented for customised function...
+for (i in 1:length(file.name)){
+  tmp_file = get(file.name[i])
+  tmp_file = tmp_file %>% select(-contains("???")) # remove medial wall columns if it exists.
+
+  # Calculate average regional result and standardise it
+  for (k in 1:length(region.names)){
+    # Set names
+    tmp_region_name = region.names[k]
+    tmp_column_name = paste0("_", tmp_region_name, "_ROI")
+    
+    tmp_region_table = tmp_file %>% select("Subject", contains(tmp_column_name)) # to prevent accidentally selecting partially fit columns
+    
+    # Calculate average
+    tmp_column_name_avg = paste0(tmp_region_name, "_avg")
+    tmp_region_table[ , tmp_column_name_avg] = rowMeans(select(tmp_region_table, contains(tmp_column_name)))
+    
+    # z-score standardisation
+    tmp_column_name_scl = paste0(tmp_region_name, "_avg_scaled")
+    tmp_region_table[ , tmp_column_name_scl] = scale(select(tmp_region_table, contains("_avg")))
+    
+    tmp_file = full_join(tmp_file, tmp_region_table) # use warning message to make sure avg phenotypes are generated by correct columns
+  }
+  
+  # Remove +-5SD outliers
+  tmp_file_QC = select(tmp_file, Subject, contains("avg_scaled"))
+  tmp_file_QC = tmp_file_QC %>% mutate(across(c(2:181), ~ ifelse(. > 5 | . < -5, NA, .)))
+  
+  # write results
+  tmp_file_QC.loc = paste0("imaging_data/regional_", file.name[i], ".avg_scaled_QCed.txt")
+  write.csv(tmp_file_QC, file = here(tmp_file_QC.loc), row.names = FALSE)
+}
+```
+```{r Regional Phenotype median-outlier removal through MAD, eval=FALSE, include=FALSE}
+# Step 1: Find standardised file paths and names
+file.loc = list.files(here("imaging_data"), pattern="avg_scaled_QCed.txt", full.names=TRUE)
+file.name = gsub(here("imaging_data/|.avg_scaled_QCed.txt"), "", file.loc) # remove anything fit the patterns
+
+for (i in seq_along(file.loc)) { # for loop to read in all standardised MRI phenotypes
+  tmp_file = fread(file.loc[i])
+  
+  # format for GWAS
+  tmp_file$Subject = as.numeric(gsub("UKB", "", tmp_file$Subject))
+  tmp_file = tmp_file %>% rename(FID = Subject) %>% mutate(IID = FID) %>% relocate(FID, IID) # rename Subject to FID -> duplicate FID as IID -> move to correct order.
+  
+  assign(file.name[i], tmp_file)
+}
+
+# Step 2. Do MAD correction
+UKB_img_mad_removal(file.name)
+
+# Step 3. Write data
+regional_result_path = here("result_supplement/imaging_data_v3/")
+regional_figure_path = here("result_supplement/mad_hist_stat_v3/")
+UKB_img_write_data(file.name, regional_result_path, regional_figure_path)
+write.table(outlier_stat, file = paste0(here("result_supplement/mad_hist_stat_v3/"), "regional_phenotypes.mad_outliers.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+```{r Regional Phenotype Outlier stat further questions visualisation, fig.width=12, fig.height=6}
+# Read-in table
+outlier_stat <- read.csv2("/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/mad_hist_stat_v3/regional_phenotypes.mad_outliers.txt", sep="")
+
+# Delete repeating prefix and suffix for easy readability in graphs
+outlier_stat <- outlier_stat %>% 
+  mutate(
+    phenotype = str_remove(phenotype, "regional_"),
+    region = str_remove(region, "_avg_scaled")
+  )
+
+# Question 1: Which phenotype have most non-zero outlier counts?
+Q1 <-  outlier_stat %>% 
+  filter(outlier_Count > 0) %>%  # select rows where outlier_Count is greater than 0
+  ggplot(aes(x = phenotype)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Phenotype with regions with non-zero outlier count distribution", x = "Phenotype", y = "Count") 
+
+
+# Question 2: What outlier n distribution is like?
+Q2 <- ggplot(outlier_stat, aes(x = outlier_Count)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Outlier count distribution", x = "outliers count (0-1000)", y = "Count")
+
+# Question 3: Outlier distribution on different thresholds
+Q3.100 <- outlier_stat %>% 
+  filter(outlier_Count > 100) %>% 
+  ggplot(aes(x = phenotype)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Phenotype Count with regions with > 100 outlier count Distribution", x = "Phenotype", y = "Count")
+
+Q3.500 <- outlier_stat %>% 
+  filter(outlier_Count > 500) %>% 
+  ggplot(aes(x = phenotype)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Phenotype Count with regions with > 500 outlier count Distribution", x = "Phenotype", y = "Count")
+
+Q3.1000 <- outlier_stat %>% 
+  filter(outlier_Count > 1000) %>% 
+  ggplot(aes(x = phenotype)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Phenotype Count with regions with > 1000 outlier count Distribution", x = "Phenotype", y = "Count")
+
+# Question 4: Is there any regions that repeatedly have > 100 MAD outliers?
+Q4.100.morethan3 <- outlier_stat %>%
+  filter(outlier_Count > 100) %>% 
+  count(region) %>%
+  filter(n >= 4) %>%
+  ggplot(aes(x = region, y = n)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Regions with repeated >100 outlier counts across more than 3 phenotypes", x = "Phenotype", y = "Count")
+
+# Save in pdf
+
+for (i in 1){ # to automatically click through pdf generation
+  # generate respective histogram
+  pdf(file = here("result_supplement/mad_hist_stat_v3/regional_phenotypes.mad_questions.pdf"))
+    print(Q1)
+    print(Q2)
+    print(Q3.100)
+    print(Q3.500)
+    print(Q3.1000)
+    print(Q4.100.morethan3)
+  dev.off()
+}
+```
+
+## Global MRI phenotypes: FINALISED
+```{r Create Global Phenotypes from Regional Phenotypes}
+# Read Regional MRI phenotype data
+file.loc = list.files(here("imaging_data"), pattern="HCP.*\\.csv", full.names=TRUE)
+file.name = gsub(here("imaging_data/HCP.fsaverage.aparc_|dti_|NODDI_|.csv"), "", file.loc) # remove anything fit the patterns
+
+for (i in 1:length(file.loc)) { # for loop to read in all MRI phenotypes
+  tmp_file = fread(file.loc[i])
+  assign(file.name[i], tmp_file)
+}
+
+# Global Phenotype Table
+# left hemisphere and right hemisphere average
+for (i in file.name){ # file.name
+  tmp_file = get(i)
+  # average by hemisphere and globally to create global phenotype
+  tmp_file$lh_avg = rowMeans(select(tmp_file, contains("lh_"), -contains("???")))
+  tmp_file$rh_avg = rowMeans(select(tmp_file, contains("rh_"), -contains("???")))
+  tmp_file$global_avg = (tmp_file$lh_avg + tmp_file$rh_avg)/2
+  
+  # global phenotype standardisation
+  tmp_file$lh_avg_scaled = scale(tmp_file$lh_avg)
+  tmp_file$rh_avg_scaled = scale(tmp_file$rh_avg)
+  tmp_file$global_avg_scaled = scale(tmp_file$global_avg)
+  
+  #rename for later merging
+  colnames(tmp_file) = paste(colnames(tmp_file), i, sep=".")
+  colnames(tmp_file)[1] <- "Subject"
+  
+  #assign to new data frame variable
+  assign(paste0(i,".avg"), select(tmp_file, Subject, contains("avg")))
+}
+
+global.pheno = mget(paste0(file.name, ".avg")) %>% reduce(full_join, by = "Subject") # merge all data frames into one master table
+write.csv(global.pheno, file=here("result_table/global.pheno.avg.scaled.txt"))
+```
+```{r Global Phenotype z-score standardisation and outlier removal, eval=FALSE, include=FALSE}
+# Step 1: Remove mean+-5SD outliers and only leave scaled global phenotype in
+global.pheno.QCed = select(global.pheno, Subject, contains("scaled"))
+global.pheno.QCed = global.pheno.QCed %>% mutate(across(c(2:37), ~ ifelse(. > 5 | . < -5, NA, .)))
+write.csv(global.pheno.QCed, file=here("result_table/global.pheno.QCed.txt"))
+
+# Step 2: Format for GWAS
+global.pheno.QCed = fread(here("result_table/global.pheno.QCed.txt"), drop = "V1") %>% select("Subject", contains("global")) # select only global phenotypes, remove hemisphere-based phenotypes
+global.pheno.QCed$Subject = as.numeric(gsub("UKB", "", global.pheno.QCed$Subject))
+global.pheno.QCed = global.pheno.QCed %>% rename(FID = Subject) %>% mutate(IID = FID) %>% relocate(FID, IID) # rename Subject to FID -> duplicate FID as IID -> move to correct order.
+
+# Step 3: run mad removal
+UKB_img_mad_removal("global.pheno.QCed")
+
+# Step 4: Write data
+global_result_path = here("result_supplement/imaging_data_v3/")
+global_figure_path = here("result_supplement/mad_hist_stat_v3/")
+UKB_img_write_data("global.pheno.QCed", global_result_path, global_figure_path)
+write.table(outlier_stat, file = paste0(here("result_supplement/mad_hist_stat_v3/"), "global_phenotypes.mad_outliers.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE) # outlier stat
+```
+
+# Genetic Data preprocessing
+## keep id and extract SNP list for PLINK
+```{r Quality Control for Participant ID, eval=FALSE, include=FALSE}
+# Find unique id number for participants with any MRI phenotype data
+MRI.id.list = list(CT$Subject, FA$Subject, FI$Subject, GC$Subject, GMV$Subject, IC$Subject, ICVF$Subject, ISOVF$Subject, MC$Subject, MD$Subject, OD$Subject, SA$Subject)
+keep.id = flatten(MRI.id.list)
+keep.id = unique(keep.id)
+
+keep.id = t(t(keep.id)) # change list to matrix, then a single row to a single column
+colnames(keep.id) = "eid"
+write.csv(keep.id, file = here("genetic_data/keep.id.UKB.txt"))
+
+# Alternatively: If you want to find shared common ID that have data across all MRI phenotype
+# keep.id = Reduce(intersect, list(CT$Subject, FA$Subject, FI$Subject, GC$Subject, GMV$Subject, IC$Subject, ICVF$Subject, ISOVF$Subject, MC$Subject, MD$Subject, OD$Subject, SA$Subject))
+
+# Participants QC
+  # Select Self-identified white Europeans {keep 21000-0.0 %in% 1, 1001, 1002, 1003}
+  # Remove Excessive heterozygosity {keep 22027-0.0 == NA}
+  # Find Reported Sex and Genetic Sex Mismatch {keep 31-0.0 == 22001-0.0, ignore sex in NA if genetic sex is present} : Expected mistmatch number ~300 cases
+  # Remove gPCA outliers using PCA1 and PCA2 to ensure genetically homozygous white European population {keep "22009-0.1" within its mean+-5SD and "22009-0.2" within its mean+-5SD}
+
+# Pull relative fields from UKB latest data freeze
+field_QC = c("eid", "21000-0.0", "31-0.0", "22001-0.0", "22027-0.0", "22009-0.1", "22009-0.2") 
+QC = fread("/rds/user/yg330/rds-rb643-ukbiobank2/Data_Phenotype/DataFetch_20022024/ukb677594.csv",select = field_QC, header = T,sep=",")
+
+QC_white = QC %>% filter(`21000-0.0` %in% c(1, 1001, 1002, 1003)) # Self-identified white Europeans
+QC_white_low.hetero = filter(QC_white, is.na(QC_white$`22027-0.0`)) # Excessive heterozygousity (Expected 900 cases)
+
+
+QC_white_low.hetero_with.mis.sex = filter(QC_white_low.hetero, QC_white_low.hetero$`31-0.0` != QC_white_low.hetero$`22001-0.0`) # find rows with mismatch (Expected ~300 cases)
+QC_white_low.hetero_with.cor.sex = filter(QC_white_low.hetero, !QC_white_low.hetero$eid %in% QC_white_low.hetero_with.mis.sex$eid) # remove the rows with mismatch sex
+
+# Remove gPCA outliers to ensure population is genetically homozygous
+PC1_mean = mean(na.omit(QC_white_low.hetero_with.cor.sex$`22009-0.1`))
+PC1_sd = sd(na.omit(QC_white_low.hetero_with.cor.sex$`22009-0.1`))
+PC1_up.range = PC1_mean + 5*PC1_sd
+PC1_low.range = PC1_mean - 5*PC1_sd
+
+PC2_mean = mean(na.omit(QC_white_low.hetero_with.cor.sex$`22009-0.2`))
+PC2_sd = sd(na.omit(QC_white_low.hetero_with.cor.sex$`22009-0.2`))
+PC2_up.range = PC2_mean + 5*PC2_sd
+PC2_low.range = PC2_mean - 5*PC2_sd
+
+QC_white_low.hetero_with.cor.sex.homozygous = QC_white_low.hetero_with.cor.sex %>% filter(between(`22009-0.1`, PC1_low.range, PC1_up.range) & between(`22009-0.2`, PC2_low.range, PC2_up.range)) 
+# Keep only rows within range in both PC1 and PC2
+
+write.csv(QC_white_low.hetero_with.cor.sex.homozygous, file= here("result_table/UKB_ID.QCed.txt"), row.names = FALSE)
+
+# Use UKB QCed population to filter out participants in the imaging
+keep.id = fread(here("genetic_data/keep.id.UKB.txt"), drop = "V1", header = TRUE) # data read-in
+keep.id =  gsub("UKB", "", keep.id$eid) # grab UKB ID
+
+keep.id.QCed = filter(QC_white_low.hetero_with.cor.sex.homozygous, QC_white_low.hetero_with.cor.sex.homozygous$eid %in% keep.id) # select UKB ID where it is in the UKB QCed list
+keep.id.QCed = select(keep.id.QCed, eid, `22001-0.0`) # select eid and sex
+keep.id.QCed = rename(keep.id.QCed, "gSEX" = `22001-0.0`) # rename for better recognition
+write.csv(keep.id.QCed, file = here("genetic_data/keep.id.UKB.QCed.txt"), row.names = FALSE)
+
+# TODO: Check the following with Varun
+# 14525	22003-0.0	487980	Continuous	Heterozygosity
+# 14526	22004-0.0	487980	Continuous	Heterozygosity, PCA corrected
+# 14527	22005-0.0	487980	Continuous	Missingness
+
+# Use PCA corrected heterozygosity instead please
+```
+```{r Create Data required for GWAS: Extract SNP list, eval=FALSE, include=FALSE}
+# QC step:
+# Filter for MAF > 0.001
+# Imputation Quality R2 > 0.4
+# No need for filter for hwe (Hardy-Weinberg Equilibrium) > 0.000001 as it has already been done during imputation step by UKB
+
+# SNP genotype data
+file.loc = list.files(here("genetic_data"), pattern="v3.txt", full.names=TRUE) # grab all chromosome file locations
+file.name = gsub(here("genetic_data/ukb_mfi_|_v3.txt"), "", file.loc) # remove anything fit the patterns
+
+for (i in 1:15) { # Create a list of SNPs that have v6 {MAF > 0.001} and imputation v8 {r2 > 0.4} -> on 2 core, R will die after 15 chromosomes
+  tmp_file = fread(file.loc[i])
+  tmp_file = filter(tmp_file, tmp_file$V6>0.001 & tmp_file$V8 > 0.4)
+  tmp_name = paste0("genetic_data/ukb_", file.name[i],".QCed.txt")
+  write.csv(tmp_file, file = here(tmp_name))
+}
+
+for (i in 15:length(file.loc)) { # Create a list of SNPs that have v6 {MAF > 0.001} and imputation v8 {r2 > 0.4}
+  tmp_file = fread(file.loc[i])
+  tmp_file = filter(tmp_file, tmp_file$V6>0.001 & tmp_file$V8 > 0.4)
+  tmp_name = paste0("genetic_data/ukb_", file.name[i],".QCed.txt")
+  write.csv(tmp_file, file = here(tmp_name))
+}
+
+# merge all to create SNP list
+SNP.loc = list.files(here("genetic_data"), pattern="ukb_chr", full.names=TRUE) # grab all chromosome file locations
+keep.SNP = data.frame(SNP_loc = character(0), rs_id = character(0))
+  
+for (i in 1:length(SNP.loc)) {
+  tmp_file = select(fread(SNP.loc[i], drop=1), c("V1", "V2"))
+  tmp_file = rename(tmp_file, "SNP_loc" = "V1", "rs_id" = "V2")
+  keep.SNP = full_join(keep.SNP, tmp_file)
+}
+
+
+```
+```{r Create keep and extract files for generating bfiles for running GCTA and making GRM, eval=FALSE, include=FALSE}
+# correctly formatted id file to --keep
+keep.id.QCed = fread(here("genetic_data/keep.id.UKB.QCed.txt"))
+keep.id.QCed.formatted = keep.id.QCed %>% select(eid) %>% mutate(FID = eid, IID = eid) %>% select(FID, IID) # remove gsex; create FID and IID; remove eid so everything is in GCTA format
+write.table(keep.id.QCed.formatted, file = here("genetic_data/keep.id.UKB.QCed.formatted.txt"), row.names = FALSE, col.names = FALSE)
+
+# correctly formatted SNP file to --extract
+chr.SNP.list = list.files(here("genetic_data"), pattern = "ukb_chr", full.names = TRUE)
+chr.SNP.list = grep(chr.SNP.list, pattern = "formatted", invert = TRUE, value = TRUE)
+
+for (i in 1:length(chr.SNP.list)){ # loop for generating and selecting only SNP lists
+  tmp_file = fread(chr.SNP.list[i])
+  tmp_file = select(tmp_file, "V2")
+  tmp_name = gsub(".txt", "", chr.SNP.list[i])
+  tmp_name.loc = paste0(tmp_name, ".formatted.txt")
+  write.table(tmp_file, file = tmp_name.loc, row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+# generate mbgen for GCTA to read bgen files
+bgen.loc = list.files("/rds/user/yg330/rds-rb643-ukbiobank2/Data_Genetics/Genetic_data/Imputed", pattern = "_v3.bgen", full.names = TRUE)
+bgen.loc.autosome = grep(bgen.loc, pattern = "X", invert = TRUE, value = TRUE) %>% str_sort(numeric = TRUE) # remove x chromosome and sort so gcta is reading it in chromosome numbers
+
+write.table(bgen.loc.autosome, file = here("genetic_data/bgen.loc.txt"), row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# sample file and bgen file for GRM:
+
+  # All sample file for chr1 to chr 22 is same, thus only copied ***_chr1_v3_***.sample data to working directory under the name ukb20904_imp_v3_s487334.sample.
+  # In GCTA: Sex coding: "1" or "M" for male and "2" or "F" for female.
+  # Checked in UKB coding: "1" for male and "2" for female = no need to update :)
+  # Everything in .sample looks all correct!
+
+# Check Script for GRM generation log:
+# Timeline: PLINK_Make_Bed.sh >>> GCTA_GRM_***.sh >>> Make_Sparse0.05GRM_***.sh
+# Purpose:  pgen to bfiles    >>> GRM per chr*    >>> sparse GRM all autosome
+
+# For chromosome X and XY:
+# Use ukb20904_imp_chrX_v3_s486676.sample instead for sample size as two are different from each other.
+```
+# COVAR Data preprocessing
+```{r Generate formatted files for GWAS, eval=FALSE, include=FALSE}
+# Read in Tables with extra info
+UKB.ID.QCed = fread(here("genetic_data/keep.id.UKB.QCed.txt"), header = TRUE)
+UKB.ID.QCed$eid = as.character(UKB.ID.QCed$eid)
+UKB.covar = fread(here("imaging_data/UKBv3.csv"), select = c("participant", "session", "run", "study", "SurfaceHoles", "sex", "site", "dx", "age_days")) # contains Eular, MRI site, and diagnosis data. # This table contains other data such as total brain volume and total grey matter volume.
+UKB.covar = UKB.covar %>% filter(UKB.covar$session == "ses-01") # only select session 1, as we are not interested in longitudinal study yet with only 1504 people in it.
+UKB.motion.covar = fread(here("imaging_data/UKB_Motion.csv")) # contains fd and fd_max data
+
+# format so every table can be merged with the same eid column.
+UKB.motion.covar$eid = gsub("UKB", "", UKB.motion.covar$eid) # remove "UKB" to fit eid format with every other table
+UKB.covar$eid = gsub("UKB", "", UKB.covar$participant)
+UKB.covar.all = left_join(UKB.ID.QCed, UKB.covar, by = "eid") # merge by QCed ID list from UKB.ID.QCed
+UKB.covar.all = left_join(UKB.covar.all, UKB.motion.covar, by = "eid")
+UKB.covar.all$eid = as.numeric(UKB.covar.all$eid)
+UKB.covar.all$FID = UKB.covar.all$eid # Set FID and IID so it's in the fastGWA format
+UKB.covar.all$IID = UKB.covar.all$eid # Set FID and IID so it's in the fastGWA format
+
+# Investigate NA population (These will be automatically ignored by GCTA-fastGWA, thus will be excluded from reported population)
+sum(is.na(UKB.covar.all$fd)) # 2637 people
+sum(is.na(UKB.covar.all$fd_max)) # 2637 people
+sum(is.na(UKB.covar.all$SurfaceHoles)) # 20 people
+
+
+```
+```{r Create Disecrete COVAR}
+# Create Discrete COVAR Table
+  # Sex
+  # MRI Scanning Site
+  # T1T2 availability status (Structural MRI Only)
+
+# Code MRI Site to numbers
+table(UKB.covar.all$site) # 4 MRI scanning site: Bristol:1  Cheadle:2   Newcastle:3   Reading:4
+UKB.covar.all = UKB.covar.all %>% mutate(site_id = recode(site, "Bristol" = 1, "Cheadle" = 2, "Newcastle" = 3, "Reading" = 4))
+
+# Generate T1T2 availability status
+UKB_MRI.pop = list.files(path = "/rds/project/rb643/rds-rb643-ukbiobank2/Data_Imaging", pattern = "UKB") # Gather all UKB MRI participant ID existed in the Data_Imaging folder
+UKB_MRI.pop.dir = list.files(path = "/rds/project/rb643/rds-rb643-ukbiobank2/Data_Imaging", pattern = "UKB", full.names = TRUE) # Gather all UKB MRI participant ID full directory existed in the Data_Imaging folder
+UKB_MRI.pop.T2_dir = paste0(UKB_MRI.pop.dir, "/anat/T2_FLAIR") # Theoretical directory if T2_FLAIR exist
+UKB.T1T2 = data.frame(IID = character(), T1T2 = integer())
+
+for (i in 1:length(UKB_MRI.pop)){
+  UKB.T1T2[i,1] = UKB_MRI.pop[i]
+  UKB.T1T2[i,2] = ifelse(dir.exists(UKB_MRI.pop.T2_dir[i]), 1, 0) # if T2_FLAIR folder exist = 1, if not = 0
+}
+
+write.table(UKB.T1T2, file =here("result_table/UKB.T1T2.txt"), row.names = F, col.names = T, quote = F) # write in correct format
+
+# Create discrete COVAR
+T1T2 = fread(here("result_table/UKB.T1T2.txt"))
+T1T2$IID = gsub("UKB", "", T1T2$IID) # remove "UKB" to fit eid format with every other table
+T1T2$FID = T1T2$IID # duplicate FID from IID to keep format for GCTA
+T1T2 = T1T2 %>% mutate_if(is.character,as.numeric) # make sure everything is in number so GCTA can read it
+
+discrete.COVAR = UKB.covar.all %>% select("FID", "IID", "gSEX", "site_id") # FID; IID; genetic sex; site_id
+discrete.COVAR = left_join(discrete.COVAR, T1T2, by = c("FID", "IID")) # merge to get T1T2
+discrete.COVAR = discrete.COVAR %>% mutate_if(is.character,as.numeric) # make sure everything is in number so GCTA can read it
+write.table(discrete.COVAR, file = here("result_table/structural.discrete.COVAR.formatted.txt"), row.names = F, quote = F)
+
+# remove T1T2 for diffusional phenotype:
+diffusion.discrete.COVAR = discrete.COVAR[,-"T1T2"]
+write.table(diffusion.discrete.COVAR, file =here("result_table/diffusion.discrete.COVAR.formatted.txt"), row.names = F, quote = F) # write in correct format
+
+```
+```{r Create Continous COVAR}
+# Create Continuous COVAR Table
+  # "Age" - from Richard's dataset "age_days", it's age at scanning" - scaled()
+  # "Agesquared" - scaled(Age (days))^2 
+  # "Age_Sex" and "Age_Sex^2" - scaled(sex[0/1]) * "Age and scaled(sex[0/1]) * agesquared
+  # "genetic PCA": "22009-0.1","22009-0.2","22009-0.3","22009-0.4","22009-0.5","22009-0.6","22009-0.7","22009-0.8","22009-0.9","22009-0.10",
+  #                "22009-0.11","22009-0.12","22009-0.13","22009-0.14","22009-0.15","22009-0.16","22009-0.17","22009-0.18","22009-0.19","22009-0.20"
+  #                "X22009-0.21", "X22009-0.22", "X22009-0.23","X22009-0.24", "X22009-0.25", "X22009-0.26", "X22009-0.27", "X22009-0.28", "X22009-0.29","X22009-0.30",
+  #                "X22009-0.31", "X22009-0.32", "X22009-0.33", "X22009-0.34", "X22009-0.35","X22009-0.36", "X22009-0.37", "X22009-0.38", "X22009-0.39", "X22009-0.40"
+  # "Euler" = SurfaceHoles
+  # "fd" and "fd_max": framepair displacement
+  # genotype batch: "22000-0.0" - Added as continuous even though it is discrete COVAR as GCTA reported that there is too many levels to compute (>100!) and suggested moving it to qCOVAR
+
+field_cont.covar = c("eid", "22000-0.0", "22009-0.1","22009-0.2","22009-0.3","22009-0.4","22009-0.5","22009-0.6","22009-0.7","22009-0.8","22009-0.9","22009-0.10", "22009-0.11","22009-0.12","22009-0.13","22009-0.14","22009-0.15","22009-0.16",
+                     "22009-0.17","22009-0.18","22009-0.19","22009-0.20", "22009-0.21", "22009-0.22", "22009-0.23","22009-0.24", "22009-0.25", "22009-0.26", "22009-0.27", "22009-0.28", "22009-0.29","22009-0.30", "22009-0.31", "22009-0.32", 
+                     "22009-0.33", "22009-0.34", "22009-0.35","22009-0.36", "22009-0.37", "22009-0.38", "22009-0.39", "22009-0.40")
+continous.COVAR = fread("/rds/user/yg330/rds-rb643-ukbiobank2/Data_Phenotype/DataFetch_20022024/ukb677594.csv",select = field_cont.covar, header = T,sep=",")
+
+
+continous.COVAR = left_join(UKB.covar.all, continous.COVAR, by = "eid")
+continous.COVAR = continous.COVAR %>% select("FID", "IID", "age_days", all_of(field_cont.covar), "SurfaceHoles", "fd", "fd_max", "gSEX") %>% select(-eid) # FID; IID; age; gPCA (1-40); euler; fd; fd_max
+continous.COVAR = continous.COVAR %>% rename_with(~ gsub("22009-0.", "gPCA", .x, fixed = TRUE)) # rename all 22009-0. to gPCA for easier readability
+continous.COVAR = continous.COVAR %>% rename("euler" = "SurfaceHoles", "gbatch"  = "22000-0.0") # rename SurfaceHoles to Euler Index as Richard said it is Euler Index, similarly rename "22000-0.0" as gbatch
+write.csv(continous.COVAR, file = here("result_table/continous.COVAR.txt"), row.names = F, quote = F)
+
+# standardisation
+continous.COVAR.scaled = fread(here("result_table/continous.COVAR.txt"))
+continous.COVAR.scaled$age_days_sqred = continous.COVAR.scaled$age_days**2 # to generate age_squared
+continous.COVAR.scaled[,c(3,5:49)] <- lapply(continous.COVAR.scaled[,c(3,5:49)], scale)
+
+# generate age_sex and age_sex^2
+continous.COVAR.scaled$age_sex = continous.COVAR.scaled$age_days * continous.COVAR.scaled$gSEX
+continous.COVAR.scaled$age_sqred_sex = continous.COVAR.scaled$age_days_sqred * continous.COVAR.scaled$gSEX
+continous.COVAR.scaled = continous.COVAR.scaled %>% select(-gSEX) # remove gSEX as it's continous covar only.
+write.table(continous.COVAR.scaled, file =here("result_table/continous.COVAR.formatted.txt"), row.names = F, quote = F) # write in correct format
+```

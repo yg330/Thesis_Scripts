@@ -1,0 +1,2220 @@
+# library
+```{r setup}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+
+# !! IMPORTANT SET UP NOTE if you're using Web Rstudio !!
+# If you plan to use generate any brain plot using ggseg() and their subsequent packages please remember to load gdal/3.7.0-icl as additional module
+
+# For code reproducibility: and git
+library(here) # project-based relative path finding
+library(glue) # refer to private path
+
+# For data manipulation
+library(tidyverse)
+library(data.table)
+library(readxl)
+
+# For general plot generation
+library(pals) # colour pallet
+library(patchwork) # for combining multiple graphs
+library(ggpubr)
+
+MRI_pheno_all.colors <- setNames(trubetskoy(13), MRI_pheno_all.list_full) # Set unique colour identifier for each MRI phenotypes
+MRI_pheno.order = c(DTI_pheno.list, STR_pheno.list, "Vol")
+
+MRI_pheno_all.full_name <- c(
+  SA    = "Surface area",
+  CT    = "Cortical thickness",
+  FI    = "Folding index",
+  GC    = "Gaussian curvature",
+  GMV   = "Grey matter volume",
+  IC    = "Intrinsic curvature index",
+  MC    = "Mean curvature",
+  FA    = "Fractional anisotropy",
+  ICVF  = "Intracellular volume fraction",
+  ISOVF = "Isotropic volume fraction",
+  MD    = "Mean diffusivity",
+  OD    = "Orientation dispersion index",
+  Vol   = "Volume"
+)
+
+master_path_file = fread(here("script_manuscript/master_GWAS_file_path.txt")) # A Tab seperated path collection of all GWAS-related files, DO NOT UPLOAD TO GIT
+# write.table(UPDATE, here("script_manuscript/master_GWAS_file_path.txt"), sep = "\t", quote = FALSE, col.names = FALSE)
+
+sup_table_name_cleaner = function(df, col_name = "GWAS_name") { # remove naming common problem from files for this project
+  df = df %>%
+    mutate(
+      across(all_of(col_name), \(x) {
+        x = gsub("combined_|GWAS_|DTI_|STR_|\\.p_1e_03\\.txt|_avg_scaled|X", "", x)
+        x = gsub("_as_pheno\\d+", "", x)
+        x = gsub("SubCorVol", "SubCor_Vol", x)
+        x = gsub("CC_", "CC.", x)
+        x = gsub("Mid_", "Mid.", x)
+        x = gsub("_l", ".l", x)
+        x = gsub("_r", ".r", x)
+        x
+      })
+    )
+  return(df)
+}
+
+sup_table_formatter = function(df, col_name = "GWAS_name"){
+  # Splits GWAS_name (e.g. "regional_CT_bankssts.lh_GWAS") into MRI_scale, MRI_pheno, and region columns while removing all other non-important info.
+  df = df %>% separate_wider_delim(all_of(col_name), "_", 
+                                    names = c("MRI_scale", "MRI_pheno", "region", NA, NA), 
+                                    too_few = "align_start", too_many = "merge")
+  
+  # Sets region to NA for global phenotypes as they have no regional parcellation.
+  df$region = ifelse(df$MRI_scale == "global", NA, df$region)
+  
+  return(df)
+}
+
+# auto generator for hpc-slurm-based commands in .sh files.
+source(here("script_manuscript/slurm_scheduler.R"))
+
+# For UKB:
+# ldsc h2 and sumstat only includes autosomal HapMap3 SNP list I believe so the numbers for these files for UKB before and after adding X chromosome should not change.
+# I also did check the rg between UKB_all and UKB_auto and it returned rg as 1 so I'm quite confident this is the case.
+```
+```{r template for master path update, eval=FALSE, include=FALSE}
+UKB_manhattan = list.files(here("meta_MRI_post_GWAS/UKB_manhattan"), full.names = TRUE)
+UKB_p_1e03.df = data.frame(GWAS_name = basename(UKB_manhattan), UKB_all_GWAS_path.P1e03 = UKB_manhattan)
+UKB_p_1e03.df$GWAS_name = gsub("combined_GWAS_|DTI_|STR_|.p_1e_03.txt|_avg_scaled|X", "", UKB_p_1e03.df$GWAS_name)
+UKB_p_1e03.df$GWAS_name = gsub("SubCorVol", "SubCor_Vol", UKB_p_1e03.df$GWAS_name)
+UKB_p_1e03.df$GWAS_name = gsub("CC_", "CC.", UKB_p_1e03.df$GWAS_name)
+UKB_p_1e03.df$GWAS_name = gsub("_l", ".l", UKB_p_1e03.df$GWAS_name)
+UKB_p_1e03.df$GWAS_name = gsub("_r", ".r", UKB_p_1e03.df$GWAS_name)
+UKB_p_1e03.df$GWAS_name = gsub("Mid_", "Mid.", UKB_p_1e03.df$GWAS_name)
+
+test = full_join(master_path_file,UKB_p_1e03.df)
+write.table(test, here("script_manuscript/master_GWAS_file_path.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+```{r Function: ldsc batch read h2 log}
+ldsc_h2_batch_read <- function(file_paths, file_names=NULL) {
+  # Initialize an empty list to store results
+  results_list <- vector("list", length(file_paths))
+  
+  # Loop through each file path
+  for (i in seq_along(file_paths)) {
+    current_path <- file_paths[i]
+    
+    # Skip if NA, empty, or file doesn't exist
+    if (is.na(current_path) || current_path == "" || !file.exists(current_path)) next
+    
+    current_file <- readLines(current_path, warn = FALSE)  # Avoid warnings for empty lines
+    
+    # Safe function to extract numeric values
+    extract_value <- function(pattern, word_index) {
+      pos <- grep(pattern, current_file)
+      if (length(pos) > 0) { # check if pattern was found
+        value <- scan(current_path, what = "character", skip = pos[1] - 1, nlines = 1, quiet = TRUE)
+        if (length(value) >= word_index) { # check if word index exist
+          return(as.numeric(gsub("[()]", "", value[word_index])))
+        }
+      }
+      return(NA)  # Return NA if not found
+    }
+    
+    # Extract values
+    h2 <- extract_value("Total Observed scale h2", 5)
+    h2_se <- extract_value("Total Observed scale h2", 6)
+    
+    lambda_GC <- extract_value("Lambda GC", 3)
+    mean_chi_squared <- extract_value("Chi", 3)
+    
+    Intercept <- extract_value("Intercept", 2)
+    Intercept_se <- extract_value("Intercept", 3)
+    
+    ratio <- extract_value("Ratio", 2)
+    ratio_se <- extract_value("Ratio", 3)
+    
+    # If file names were provided accordingly
+    if (is.null(file_names)) {GWAS_name = basename(current_path)} else {GWAS_name = file_names[i]}
+    
+    # Store results in the list
+    results_list[[i]] <- data.frame(
+      GWAS_name = GWAS_name,
+      Lambda_GC = lambda_GC,
+      Mean_chi_square = mean_chi_squared,
+      h2 = h2,
+      h2_se = h2_se,
+      Intercept = Intercept,
+      Intercept_se = Intercept_se,
+      Ratio = ratio,
+      Ratio_se = ratio_se,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  # Combine all results into a single data frame
+  results_df <- do.call(rbind, results_list)
+  
+  return(results_df)
+}
+```
+```{r Function: ldsc batch read rg log}
+ldsc_rg_batch_read = function(file_path, file_name){
+  require(tidyverse)
+  df_list = vector("list", length(file_path))
+  
+  for (i in seq_along(file_path)){
+    # read file
+    current_path = file_path[i]
+    
+    # read as vector of lines
+    current_file = readLines(current_path)
+    
+    # Find the position of "Summary of Genetic Correlation Results" for current_file
+    result_position = grep("Summary of Genetic Correlation Results", current_file)
+    start_position = result_position + 1
+    end_position = length(current_file) - 3
+    
+    # read ldsc table
+    current_file_formatted = current_file[start_position:end_position]
+    
+    df = fread(text = current_file_formatted)
+    
+    # format for easy visualisation
+    df$p1_base = basename(df$p1)
+    df$p1_base = gsub(".sumstats|.gz", "", df$p1_base)
+    
+    df$p2_base = basename(df$p2)
+    df$p2_base = gsub(".sumstats|.gz", "", df$p2_base)
+    
+    # Find p label - if "<" detected assign *** directly, otherwise cut as normal
+    df$p.label <- ifelse(grepl("<", df$p), "***",
+                    as.character(cut(as.numeric(df$p), 
+                        breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), 
+                        labels = c("***", "**", "*", NA))))
+    
+    # Find Confidence Interval (CI) at 95%
+    df$CI <- df$se*1.96
+    
+    df_list[[i]] = df
+  }
+  
+  # Merge all data frames into one
+  result = Reduce(function(x, y) full_join(x, y), df_list)
+  result = result %>% relocate(p1_base, p2_base) %>% select(!c(p1, p2))
+  return(result)
+}
+```
+```{r Function: PLINK batch read clump files}
+clump_batch_read <- function(GWAS_name, GWAS_path) {
+  # check for NA as some do not have loci pass 5e-8 threshold or simply not available for the GWAS selected
+  valid_paths <- !is.na(GWAS_path) & GWAS_path != "" & file.exists(GWAS_path)
+  
+  # Create a list of data frames with the GWAS_name column
+  gwas_tables <- map2(GWAS_name[valid_paths], GWAS_path[valid_paths], ~ {
+    fread(.y) %>% 
+      mutate(GWAS_name = .x)
+  })
+  # Merge all tables using full_join
+  merged_table <- reduce(gwas_tables, full_join)
+  
+  return(merged_table)
+}
+```
+
+# Section 1: Basic GWAS info
+```{r Section 1 specific library}
+# For brain plot generation
+library(ggseg)
+library(ggseg.formats)
+library(ggsegGlasser)
+```
+
+## Supplement table 1: UKB and ABCD demographic info
+```{r ST1: Sex and Age Information in regards to UKB and ABCD used for GWAS generation}
+UKB_demographic = fread(here("MRI_GWAS_COVAR/components/continous.COVAR.txt"))
+UKB_demographic$age_years = UKB_demographic$age_days/365
+UKB_demographic = UKB_demographic %>% mutate(SEX = recode(gSEX, `0` = "Female", `1` = "Male"))
+
+table(UKB_demographic$SEX)
+summary(round(UKB_demographic$age_years, digits = 2))
+round(sd(UKB_demographic$age_years), digits = 2)
+
+# Grab ABCD.COVAR.ALL from ABCD_data_preprocessing.Rmd
+ABCD.PCA = fread(here("MRI_GWAS_COVAR/components/ABCD_PCsforGWAS_European.txt"))
+ABCD.COVAR = fread(glue("{path_vw}ABCD/Imaging_phenotypes/ABCD_allcovariates.txt"))
+ABCD.COVAR.filtered = left_join(ABCD.PCA, ABCD.COVAR, by = c("Sample_name" = "FID"))
+
+ABCD_demographic = ABCD.COVAR.filtered %>% select(gender, interview_age)
+ABCD_demographic.noNA = na.omit(ABCD_demographic) # remove anyone who do not have gender and age
+ABCD_demographic.noNA$age_years = ABCD_demographic.noNA$interview_age/12
+ABCD_demographic.noNA = ABCD_demographic.noNA %>% mutate(SEX = recode(gender, `1` = "Female", `0` = "Male"))
+
+table(ABCD_demographic.noNA$SEX)
+summary(round(ABCD_demographic.noNA$age_years, digits = 2))
+round(sd(ABCD_demographic.noNA$age_years), digits = 2)
+```
+## Supplement file 1: MRI phenotype correlation matrix
+```{r SF1: Generate MRI phenotype correlation matrix, eval=FALSE, include=FALSE}
+# Phenotype Spectral Decomposition (PhenoSpD) used for phenotype correlation estimation and multiple testing correction for GWAS: https://github.com/MRCIEU/PhenoSpD
+# option 1 is used when we have GWAS but do not have phenotype correlation matrix, option 2 is used when we do have phenotype correlation matrix.
+# This tool is based on MatSpD: Newest version and instructions avaliable at https://research.qut.edu.au/sgel/software/matspd-local-version/
+
+# Read formatted global and regional phenotypes
+file.loc = list.files(here("GWAS_Trait/imaging_data_v3"), pattern=".sd.mad.QCed.txt", full.names=TRUE)
+file.name = gsub(".formatted|.sd|.mad|.QCed|.txt", "", basename(file.loc)) # remove anything fit the patterns
+
+# for loop to read and format all MRI phenotypes
+for (i in 1:length(file.loc)) { 
+  # read table, drop FID column but keep IID for merging tables
+  tmp_file = fread(file.loc[i], drop = c("FID")) 
+  
+  # format for easier reading
+  colnames(tmp_file) = gsub("_avg_scaled", "", colnames(tmp_file))
+  
+  # rename non-IID columns (which = colnames(tmp_file)[-1]) for distinguish names
+  if (grepl("regional|tract", file.loc[i])) {
+    col_prefix = gsub("regional_|tract_", "", file.name[i])
+    colnames(tmp_file)[-1] = paste0(col_prefix, "_", colnames(tmp_file)[-1])
+  }
+  assign(file.name[i], tmp_file)
+}
+
+# merge table
+df_list = mget(file.name)
+MRI_phenotypes = df_list %>% reduce(full_join, by='IID') %>% select(-IID)
+
+# Generate Correlation Matrix
+MRI_phenotypes = as.data.table(MRI_phenotypes) # Optimise for running times 
+MRI_cor = cor(MRI_phenotypes, method = "pearson", use="pairwise.complete.obs")
+
+write.table(MRI_cor, file = here("result_manuscript/SF1_MRI_phenotype_correlation.matrix"), sep = " ") # This keeps row and column names so it's easier to reuse later.
+write.table(MRI_cor, file = glue("{path_yg}result_supplement/phenoSpD/correlationORcovariance.matrix"), sep = " ", row.names = FALSE, col.names = FALSE) 
+# write in personal hpc work folder in required format for script running.
+# NOTE. DO NOT CHANGE THE LINE ABOVE, THE file name, sep, row.names and col.names FORMAT WAS AS REQUIRED AS IT IS FOR THE MatSpD PROGRAMME TO RUN!!!
+```
+## Supplement table 2: Method Used to set up multiple testing correction threshold - Matrix Decomposition through Phenotype Spectral Decomposition (PhenoSpD)
+```{r ST2: Run PhenoSpD option 2, eval=FALSE, include=FALSE}
+system(glue("cd {path_vw.toolbox}PhenoSpD && Rscript ./script/phenospd.r --phenocorr {path_yg}result_supplement/phenoSpD/correlationORcovariance.matrix --out {here()}/result_manuscript/ST2_PhenoSpD_log"))
+```
+```{r ST2: Run MatSpD for replication, eval=FALSE, include=FALSE}
+source(glue("{path_yg}result_supplement/phenoSpD/matSpDliteNewAbsMatrix.R"), chdir = TRUE)
+
+# Check result at matSpDliteNewAbsMatrix.out and copy to result folder, renamed as ST2_MatSpD_log.txt
+
+# Therefore, for our GWAS files, Experimental-wide significance threshold should be:
+# α_EWS = α_GWS / number_of_tests = 5 × 10^-8 / 1075.29 = 4.65 × 10^-11
+```
+Therefore, we have 1075.29 effective independent phenotypes.
+Therefore, our Experimental-wide threshold for multiple testing for our GWAS should be: α_EWS = 5 × 10⁻⁸ / 1075.29 = 4.65 × 10⁻¹¹
+## Supplement table 3: Information on UKB and meta-GWAS: ldsc h2
+```{r ST3: master h2 table, eval=FALSE, include=FALSE}
+meta_GWAS_h2 = ldsc_h2_batch_read(file_names = master_path_file$GWAS_name, file_paths = master_path_file$meta_h2_path)
+UKB_GWAS_h2 = ldsc_h2_batch_read(file_names = master_path_file$GWAS_name, file_paths = master_path_file$UKB_h2_path)
+
+# separate name into three different columns for name and visualisation
+meta_GWAS_h2 = sup_table_formatter(meta_GWAS_h2)
+
+# separate name into three different columns for name and visualisation
+UKB_GWAS_h2 = sup_table_formatter(UKB_GWAS_h2)
+
+# full_join for comparison
+meta_col_name = colnames(meta_GWAS_h2)
+meta_col_name[(4:length(meta_col_name))] = paste0("meta_", meta_col_name[(4:length(meta_col_name))])
+colnames(meta_GWAS_h2) = meta_col_name
+
+UKB_col_name = colnames(UKB_GWAS_h2)
+UKB_col_name[(4:length(UKB_col_name))] = paste0("UKB_", UKB_col_name[(4:length(UKB_col_name))])
+colnames(UKB_GWAS_h2) = UKB_col_name
+
+master_GWAS_h2 = full_join(UKB_GWAS_h2, meta_GWAS_h2)
+write.table(master_GWAS_h2, here("result_manuscript/ST3_UKB_and_meta_h2.txt"), quote = F, row.names = F)
+```
+## Statistical Tests: MRI and Coritcal location Heritability Differences
+```{r heritability difference between MRI pheno, MRI type and MRI scale}
+master_GWAS_h2 = fread(here("result_manuscript/ST3_UKB_and_meta_h2.txt"))
+
+# Add tag for whether it's from sMRI or dMRI
+master_GWAS_h2$MRI_type = ifelse(master_GWAS_h2$MRI_pheno %in% c(STR_pheno.list, "Vol"), "STR", "DTI")
+h2_MRI_type.t_test = t.test(UKB_h2 ~ MRI_type, data = master_GWAS_h2)
+
+# t-test between MRI scale: cortical (global + regional) vs subcortical (tract + subcor)
+master_GWAS_h2$MRI_brain_scale = ifelse(master_GWAS_h2$MRI_scale %in% c("global", "regional"), "cor", "subcor")
+h2_MRI_brain_type.t_test = t.test(UKB_h2 ~ MRI_brain_scale, data = master_GWAS_h2)
+```
+```{r Check heritability p}
+master_GWAS_h2$UKB_p = 2 * pnorm(-abs(master_GWAS_h2$UKB_h2 / master_GWAS_h2$UKB_h2_se))
+table(master_GWAS_h2$UKB_p < 0.05) # 2332 so yes it's all significant
+
+master_GWAS_h2$meta_p = 2 * pnorm(-abs(master_GWAS_h2$meta_h2 / master_GWAS_h2$meta_h2_se))
+table(master_GWAS_h2$meta_p < 0.05) # 2197 is total number without tract so yes it's all significant
+```
+```{r average h2 across different MRI phenotypes}
+master_GWAS_h2 %>% 
+  group_by(MRI_pheno) %>% 
+  summarise(mean_h2 = mean(UKB_h2, na.rm = TRUE)) %>%
+  arrange(desc(mean_h2))
+```
+```{r average h2 improvement compare to previous vw2023 GWAS}
+# read in vw2023 h2
+MRI_pheno_all.full_name.r = c(
+  setNames(names(MRI_pheno_all.full_name), MRI_pheno_all.full_name),
+  "Local gyrification index" = "LGI",
+  "Intrinsic curvature" = "IC",
+  "Volume" = "GMV"
+)
+
+MRI_pheno_all.full_name.r = MRI_pheno_all.full_name.r[!duplicated(names(MRI_pheno_all.full_name.r), fromLast = TRUE)]
+
+vw2023.global.h2 = read_xlsx(here("script_manuscript/NIHMS1937250-supplement-Supplementary_Tables_1-34.xlsx"), sheet = "S4", skip = 3) %>% 
+  select(1:2) %>%
+  rename(GWAS_name = 1, meta_h2_2023 = 2)  %>% 
+  mutate(GWAS_name = MRI_pheno_all.full_name.r[GWAS_name],
+    GWAS_name = paste0("global_", GWAS_name),
+    meta_h2_2023 = round(meta_h2_2023, 2))
+  
+vw2023.regional.h2 = read_xlsx(here("script_manuscript/NIHMS1937250-supplement-Supplementary_Tables_1-34.xlsx"), sheet = "S29", skip = 3) %>% select(-1)
+vw2023.regional.h2.long = vw2023.regional.h2 %>%
+  mutate(across(-`Region name`, ~ as.numeric(str_remove(., "\\s*\\[.*\\]")))) %>%
+  pivot_longer(cols = -`Region name`, names_to = "Phenotype", values_to = "h2") %>%
+  mutate(Phenotype = MRI_pheno_all.full_name.r[Phenotype],
+    Phenotype = paste0("regional_", Phenotype, "_", `Region name`)) %>%
+  select(Phenotype, h2) %>% 
+  rename(GWAS_name = 1, meta_h2_2023 = 2)
+
+vw2023.h2 = sup_table_formatter(full_join(vw2023.global.h2, vw2023.regional.h2.long))
+
+# read in master h2 table (cortical only as vw2023 only have cortical data)
+master_GWAS_h2 = fread(here("result_manuscript/ST3_UKB_and_meta_h2.txt")) %>% 
+  select(MRI_scale, MRI_pheno, region, UKB_h2, meta_h2) %>%
+  mutate(UKB_h2 = round(UKB_h2, 2),
+         meta_h2 = round(meta_h2, 2)) %>% filter(MRI_scale == "global" | MRI_scale == "regional")
+
+h2_comparison.df = left_join(master_GWAS_h2, vw2023.h2) %>% mutate(ukb_2026_2023 = UKB_h2 - meta_h2_2023, meta_2026_2023 = meta_h2 - meta_h2_2023)
+h2_comparison.df$MRI_type = ifelse(h2_comparison.df$MRI_pheno %in% STR_pheno.list, "STR", "DTI")
+t.test(ukb_2026_2023 ~ MRI_type, data = h2_comparison.df)
+t.test(meta_2026_2023 ~ MRI_type, data = h2_comparison.df)
+```
+## Figure 1 AND Figure 2: Cortical and Subcortical H2 Heritability
+```{r table prep for figure 1 generation}
+master_GWAS_h2 = fread(here("result_manuscript/ST3_UKB_and_meta_h2.txt"))
+
+# generate CI for figures
+master_GWAS_h2 <- master_GWAS_h2 %>%
+  mutate(across(ends_with("h2_se"), ~ . * 1.96, .names = "{str_replace(.col, '_se', '_CI')}"))
+
+# Add tag for whether it's from sMRI or dMRI
+master_GWAS_h2$MRI_type = ifelse(master_GWAS_h2$MRI_pheno %in% STR_pheno.list, "STR", "DTI")
+
+# give factor level to MRI phenotypes so everything can draw in order 
+MRI_pheno.order = c(DTI_pheno.list, STR_pheno.list, "Vol")
+master_GWAS_h2 = master_GWAS_h2 %>%
+  mutate(MRI_pheno = factor(MRI_pheno, levels = MRI_pheno.order))
+
+# separate into tables for easy visualisation
+h2_global_cor = subset(master_GWAS_h2, master_GWAS_h2$MRI_scale=="global")
+h2_regional_cor = subset(master_GWAS_h2, master_GWAS_h2$MRI_scale=="regional")
+h2_subcor_tract <- subset(master_GWAS_h2, MRI_scale %in% c("tract", "SubCor"))
+```
+```{r Figure 1: Cortical heritability - global and regional phenotypes construction}
+# Figure 1a: Global IDP h2 - Bar Graph
+h2_global_vis <- ggplot(h2_global_cor, aes(x = MRI_pheno, y = UKB_h2,
+                                            ymin = UKB_h2 - UKB_h2_CI, 
+                                            ymax = UKB_h2 + UKB_h2_CI)) + 
+  geom_errorbar(color = "black", width = 0.2, linewidth = 0.5) +
+  geom_point(aes(fill = MRI_pheno), size = 3, shape = 21, stroke = 0.5, color = "black") + 
+  geom_text(aes(label = round(UKB_h2, 2), y = UKB_h2 + UKB_h2_CI), vjust = -0.5, size = 3.5) +
+  ylim(0, 0.45) + 
+  ylab("Global IDP h2") +
+  scale_fill_manual(values = MRI_pheno_all.colors, guide = "none") +
+  theme_classic() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        legend.position = "none",
+        strip.text = element_text(margin = margin(b = 6, t = 4))) +
+  facet_grid(~MRI_type, scales = "free", space = "free_x")
+
+# Figure 1b: Regional IDP h2 - Violin Graph
+h2_reg_vio.vis <- h2_regional_cor %>% 
+  ggplot(aes(MRI_pheno, UKB_h2)) + 
+  geom_violin(aes(fill = MRI_pheno)) +
+  geom_boxplot(width = 0.1) +
+  scale_fill_manual(values = MRI_pheno_all.colors, name = "MRI Phenotypes") +
+  facet_grid(~MRI_type, scale = "free", space = "free_x") + 
+  xlab("") + 
+  ylab("Regional IDP h2") +
+  ylim(0, 0.45) +
+  theme_classic() +
+  theme(panel.grid.major = element_line(color = "grey90"),
+        strip.text = element_blank(),
+        legend.position = "bottom",
+        plot.margin = margin(t = 5.5, r = 5.5, b = 0, l = 5.5)) +
+  guides(fill = guide_legend(nrow = 1))
+
+# Figure 1c: Regional IDP h2 - Glassar Brain Graph
+h2_reg_brain_vis <- h2_regional_cor %>% 
+  ggplot(mapping=aes(fill = UKB_h2)) + 
+  geom_brain(atlas = glasser(), hemi = "left", view = c("lateral", "medial"), size = 0.1, color = "darkgrey") +
+  scale_fill_viridis_c(option = "magma", na.value="grey", limits = c(0, max(master_GWAS_h2$UKB_h2)), name = "h2") +
+  facet_wrap(~MRI_pheno, nrow = 3) +
+  theme_void() +
+  theme(legend.position = "bottom",
+        plot.margin = margin(0, 0, 0, 0))
+
+# Combine all
+fig1 = (h2_global_vis / h2_reg_vio.vis / h2_reg_brain_vis) + 
+  plot_layout(guides = "collect", heights = c(1, 1, 2)) +
+  plot_annotation(theme = theme(legend.position = "bottom"))
+
+ggsave(here("result_manuscript/F3.1_cortical_regional_h2.png"), plot = fig1, width = 15, height = 14, dpi = 300, units = "in")
+ggsave(here("result_manuscript/F3.1_cortical_regional_h2.pdf"), plot = fig1, width = 15, height = 14, dpi = 300, units = "in")
+```
+```{r Figure 2 Subcortical heritability - subcorvol and tract-based phenotypes construction}
+# Figure 2a: Sub-cortical Volume and tract based IDP h2 - Violin Graph
+h2_subcor_vis <- h2_subcor_tract %>% 
+  ggplot(aes(MRI_pheno, UKB_h2)) + 
+  geom_violin(aes(fill = MRI_pheno)) +
+  geom_boxplot(width = 0.1) +
+  scale_fill_manual(values = MRI_pheno_all.colors, name = "MRI Phenotypes") +
+  facet_grid(~MRI_type, scale = "free", space = "free_x") + 
+  xlab("") + 
+  ylab("Regional IDP h2") +
+  ylim(0, 0.45) +
+  theme_classic() +
+  theme(panel.grid.major = element_line(color = "grey90"),
+        strip.text = element_blank(),
+        legend.position = "bottom",
+        plot.margin = margin(t = 5.5, r = 5.5, b = 0, l = 5.5)) +
+  guides(fill = guide_legend(nrow = 1))
+
+# Figure 2b: Tract-based IDP h2 - Brain Graph
+# Note. Rational of the label_map set up is detailed in ST4
+
+label_map <- c(
+  # ---- direct ----
+  "ar.l"  = "lh.ar.bbr.prep",
+  "atr.l" = "lh.atr.bbr.prep",
+  "cst.l" = "lh.cst.bbr.prep",
+  "ilf.l" = "lh.ilf.bbr.prep",
+  "unc.l" = "lh.uf.bbr.prep",
+  "ar.r"  = "rh.ar.bbr.prep",
+  "atr.r" = "rh.atr.bbr.prep",
+  "cst.r" = "rh.cst.bbr.prep",
+  "ilf.r" = "rh.ilf.bbr.prep",
+  "unc.r" = "rh.uf.bbr.prep",
+  "ml.l"  = "lh.mlf.bbr.prep",
+  "ml.r"  = "rh.mlf.bbr.prep",
+  "mcp"   = "mcp.bbr.prep",
+
+  # ---- proxy ----
+  "cgc.l" = "lh.cbd.bbr.prep",
+  "cgc.r" = "rh.cbd.bbr.prep",
+  "cgh.l" = "lh.cbv.bbr.prep",
+  "cgh.r" = "rh.cbv.bbr.prep",
+  "ifo.l" = "lh.emc.bbr.prep",
+  "ifo.r" = "rh.emc.bbr.prep",
+  "ptr.l" = "lh.or.bbr.prep",
+  "ptr.r" = "rh.or.bbr.prep",
+  "fmi"   = "cc.genu.bbr.prep",
+  "fma"   = "cc.splenium.bbr.prep",
+
+  # ---- subdivision (encoded as multiple labels) ----
+  "slf.l" = "lh.slf1.bbr.prep;lh.slf2.bbr.prep;lh.slf3.bbr.prep",
+  "slf.r" = "rh.slf1.bbr.prep;rh.slf2.bbr.prep;rh.slf3.bbr.prep"
+)
+
+h2_tract <- h2_subcor_tract %>%
+  filter(MRI_scale == "tract") %>%
+  mutate(label = label_map[region]) %>%
+  filter(!is.na(label)) %>%
+  tidyr::separate_rows(label, sep = ";") %>%
+  select(!region)
+
+# plot
+h2_tract_brain_vis <- h2_tract %>%
+  ggplot(aes(fill = UKB_h2)) +
+  geom_brain(atlas = tracula(),
+             view = c("axial_2", "coronal_4"),
+             size = 0.1, 
+             color = "darkgrey") +
+  scale_fill_viridis_c(option = "magma", na.value = "grey",
+                       limits = c(0, max(master_GWAS_h2$UKB_h2)), 
+                       name = "h2") +
+  facet_wrap(~MRI_pheno, nrow = 2) +
+  theme_void() +
+  theme(legend.position = "bottom")
+
+# Figure 2c: Subcortical-Volume-based IDP h2 - Brain Graph
+label_map_subcor <- c(
+  "Cerebellum.Cortex"     = "Cerebellum",
+  "Thalamus.Proper"       = "Thalamus",
+  "Thalamus.Proper"       = "Thalamus Proper",
+  "Caudate"               = "Caudate",
+  "Putamen"               = "Putamen",
+  "Pallidum"              = "Pallidum",
+  "Hippocampus"           = "Hippocampus",
+  "Amygdala"              = "Amygdala",
+  "Accumbens.area"        = "accumbens area",
+  "VentralDC"             = "ventraldc",
+  "vessel"                = "vessel",
+  "choroid.plexus"        = "choroid plexus",
+  "Brain.Stem"            = "Brain Stem",
+  "Optic.Chiasm"          = "Optic Chiasm",
+  "CC.Posterior"          = "cc posterior",
+  "CC.Mid.Posterior"      = "cc mid posterior",
+  "CC.Central"            = "cc central",
+  "CC.Mid.Anterior"       = "cc mid anterior",
+  "CC.Anterior"           = "cc anterior"
+)
+
+h2_subcor <- h2_subcor_tract %>%
+  filter(MRI_scale == "SubCor") %>%
+  mutate(region = label_map_subcor[region]) %>%
+  filter(!is.na(region)) %>%
+  bind_rows(
+    filter(., region == "Thalamus") %>%
+      mutate(region = "Thalamus Proper") # ggseg() bug, if both rows not present will only fill one side
+  )
+
+# plot
+h2_subcor_brain_vis <- h2_subcor %>%
+  ggplot(aes(fill = UKB_h2)) +
+  geom_brain(atlas = aseg(), view = c("axial_4", "sagittal", "axial_5"),
+             size = 0.1, 
+             color = "darkgrey") +
+  scale_fill_viridis_c(option = "magma", na.value = "grey",
+                       limits = c(0, max(master_GWAS_h2$UKB_h2)), 
+                       name = "h2") +
+  theme_void() +
+  theme(legend.position = "bottom") +
+  labs(title = "Subcortical Volume") +
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+
+# Combine all
+fig2 = (h2_subcor_vis / h2_subcor_brain_vis / h2_tract_brain_vis) + 
+  plot_layout(guides = "collect", heights = c(2, 1, 1.75)) +
+  plot_annotation(theme = theme(legend.position = "bottom"))
+
+ggsave(here("result_manuscript/F3.2_subcortical_regional_h2.png"), plot = fig2, width = 15, height = 17.5, dpi = 300, units = "in")
+ggsave(here("result_manuscript/F3.2_subcortical_regional_h2.pdf"), plot = fig2, width = 15, height = 17.5, dpi = 300, units = "in")
+```
+# Section 2: Comparison with previous imaging GWAS
+## Supplement file 2 AND Supplement file 3: Clumped results for UKB AND Clumped results for meta
+```{r SF2 AND SF3: Raw clumped results for UKB GWAS AND Raw clumped results for meta-GWAS, eval=FALSE, include=FALSE}
+UKB_clump = clump_batch_read(master_path_file$GWAS_name, master_path_file$UKB_clump_path)
+meta_clump = clump_batch_read(master_path_file$GWAS_name, master_path_file$meta_clump_path)
+
+UKB_clump = sup_table_formatter(UKB_clump) %>% relocate(MRI_scale, MRI_pheno, region)
+meta_clump = sup_table_formatter(meta_clump) %>% relocate(MRI_scale, MRI_pheno, region)
+
+write.table(UKB_clump, here("result_manuscript/SF2_UKB_sig.5e-8.r2.0.1.clump.txt"), row.names = F, quote = F)
+write.table(meta_clump, here("result_manuscript/SF3_meta_sig.5e-8.r2.0.1.clump.txt"), row.names = F, quote = F)
+```
+## Supplement file 4: sig.SNP.ino in either ABCD, UKB OR meta based cohorts
+```{r construction of Supplement file 4}
+# These were code used to generate ST1 tables
+source("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/vw_requested_results/batch_GWAS_stat_comparison.R")
+source("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/vw_requested_results/batch_GWAS_stat_comparison_plus_subcor_tract.R")
+source("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/vw_requested_results/missing_meta_SNP_investigate_batch_GWAS_stat_comparison.R")
+
+SF4 = fread(here("vw_requested_results/ST1_cortical_subcortical_UKB_ABCD_meta_stat_comparison.txt"))
+SF4.meta_only_SNPs = list.files(here("vw_requested_results/ST1_temp_missing"), full.names = TRUE)
+SF4.meta_only_SNPs.table = SF4.meta_only_SNPs %>% lapply(fread) %>% reduce(full_join)
+
+write.table(SF4, here("result_manuscript/SF4_sig.SNP.across.ABCD.UKB.meta_table.txt"), quote = F, row.names = F)
+```
+## Statistical Tests: Concordance between UKB and ABCD
+```{r concordance rate t-test}
+# concordance rate: BETA ONLY
+EWS.sig.UKB_in_ABCD = fread(here("result_manuscript/ST5_EWS.sig.SNP.from.UKB_compare_to_ABCD_table.txt"))
+EWS.sig.UKB_in_ABCD = sup_table_formatter(EWS.sig.UKB_in_ABCD)
+beta_concordance_rate = table(EWS.sig.UKB_in_ABCD$concordance)
+binom.test(beta_concordance_rate[1], beta_concordance_rate[2]+beta_concordance_rate[1], p = 0.5, alternative = "greater")
+
+# concordance rate: BETA and P
+EWS.sig.UKB_in_sig.ABCD <-EWS.sig.UKB_in_ABCD %>% filter(EWS.sig.UKB_in_ABCD$concordance == "Concordant" & EWS.sig.UKB_in_ABCD$ABCD_P < 0.05)
+beta_and_P_concordance_rate = table(EWS.sig.UKB_in_sig.ABCD$concordance)
+binom.test(beta_and_P_concordance_rate[1], beta_concordance_rate[2]+beta_concordance_rate[1], p = 0.05, alternative = "greater")
+
+# Concordance rate by phenotype
+beta_concordance_rate.by_MRI_pheno = table(EWS.sig.UKB_in_ABCD$concordance, EWS.sig.UKB_in_ABCD$MRI_pheno)
+beta_concordance_rate.by_MRI_pheno.pct <- prop.table(beta_concordance_rate.by_MRI_pheno, margin = 2)["Concordant", ] * 100
+
+beta_concordance_rate.by_MRI_pheno.pct.df = data.frame(
+  MRI_pheno = names(beta_concordance_rate.by_MRI_pheno.pct),
+  concordance.pct = as.numeric(beta_concordance_rate.by_MRI_pheno.pct))
+
+# statistical t-test to see if pct is different amongst MRI type
+beta_concordance_rate.by_MRI_pheno.pct.df$MRI_type = ifelse(beta_concordance_rate.by_MRI_pheno.pct.df$MRI_pheno %in% c(STR_pheno.list, "Vol"), "STR", "DTI")
+beta_concordance_rate.by_MRI_pheno.pct.df.t_test = t.test(concordance.pct ~ MRI_type, data = beta_concordance_rate.by_MRI_pheno.pct.df)
+beta_concordance_rate.by_MRI_pheno.pct.df.t_test
+```
+
+## Supplement table 5: Concordance Table
+```{r construction of Supplement table 5}
+concor.table = fread(here("result_manuscript/SF4_sig.SNP.across.ABCD.UKB.meta_table.txt"))
+
+EWS.sig.UKB_in_ABCD = concor.table %>% filter(!is.na(ABCD_BETA) & !is.na(UKB_BETA) & UKB_P < 4.653e-11)
+write.table(EWS.sig.UKB_in_ABCD, here("result_manuscript/ST5_EWS.sig.SNP.from.UKB_compare_to_ABCD_table.txt"), quote = F, row.names = F)
+```
+## Supplement file 5 AND Supplement table 6: Unique loci across neuroimaging GWAS
+```{r generate clump with r2 0.8, eval=FALSE, include=FALSE}
+bfile_path = glue("{path_UKB.vw}Imaging_genetics/yg330/UKB_LD/fileforclumping")
+awk_cmd = 'awk -F"\\t" \'{print $1, $2}\''
+
+PLINK_clump_r20.8_command = glue('
+module load plink/1.9
+tail -n +2 "{here("script_manuscript/master_GWAS_file_path.txt")}" | {awk_cmd} | while read -r gwas_name gwas_path; do
+  if [ -f "{here("meta_MRI_post_GWAS/UKB_clump_p5e-8_r20.8")}/${{gwas_name}}_clump_5e8_r2_0.8.clumped" ]; then
+    echo "SKIPPING $gwas_name: output already exists"
+    continue
+  fi
+  plink \\
+    --bfile {bfile_path} \\
+    --clump "$gwas_path" \\
+    --clump-field P \\
+    --clump-p1 0.00000005 \\
+    --clump-p2 1 \\
+    --clump-r2 0.8 \\
+    --clump-kb 1000 \\
+    --out "{here("meta_MRI_post_GWAS/UKB_clump_p5e-8_r20.8")}/${{gwas_name}}_clump_5e8_r2_0.8"
+done
+')
+
+setwd(here("script_manuscript/UKB_clump_r20.8_log")) # set script path
+
+submit_slurm(
+  account  = account,
+  job_name = "gwas_clump_r2_0.8",
+  command  = PLINK_clump_r20.8_command,
+  time     = "8:00:00",
+  mem      = "16G",
+  home_dir = here("meta_MRI_post_GWAS"),
+  log_dir  = here("script_manuscript/UKB_clump_r20.8_log"),
+  partition = "sapphire"
+)
+```
+```{r ST5: generate UKB clump r20.8 table as supplement file 5}
+UKB_r20.8_clump = clump_batch_read(master_path_file$GWAS_name, master_path_file$UKB_clump_r20.8_path)
+write.table(UKB_r20.8_clump, here("result_manuscript/SF5_UKB_sig.5e-8.r2.0.8.clump.txt"), row.names = F, quote = F)
+```
+```{r read and process loci information from different neuroimaging server}
+# Read in clump_r20.1 clump across GWAS and find unique loci
+UKB_SF2.clump.r20.1 = fread(here("result_manuscript/SF2_UKB_sig.5e-8.r2.0.1.clump.txt"))
+meta_SF3.clump.r20.1 = fread(here("result_manuscript/SF3_meta_sig.5e-8.r2.0.1.clump.txt"))
+SF2_and_SF3.clump.r20.1.unique = unique(c(UKB_SF2.clump.r20.1$SNP, meta_SF3.clump.r20.1$SNP))
+
+# Read in r20.8 clumps across GWAS
+UKB_r20.8_clump = fread(here("result_manuscript/SF5_UKB_sig.5e-8.r2.0.8.clump.txt"))
+UKB_r20.8.clump.unique = unique(UKB_r20.8_clump$SNP)
+
+# For previous UKB-based paper
+## For vw2023 paper
+MRI_pheno_all.full_name.r <- setNames(names(MRI_pheno_all.full_name), MRI_pheno_all.full_name) # for converting full name to shortened names
+
+MRI_pheno_all.full_name.r <- c(
+  MRI_pheno_all.full_name.r,
+  "Local gyrification index" = "LGI",
+  "Intrinsic curvature" = "IC"
+)
+
+vw2023.global = read_xlsx(here("script_manuscript/NIHMS1937250-supplement-Supplementary_Tables_1-34.xlsx"), sheet = "S1", skip = 2)
+vw2023.regional = read_xlsx(here("script_manuscript/NIHMS1937250-supplement-Supplementary_Tables_1-34.xlsx"), sheet = "S26", skip = 2)
+vw2023.regional.conversion_table = fread(here("script_manuscript/NIHMS1937250_region_number_name.txt"))
+
+vw2023.global.readable = vw2023.global %>% 
+  mutate(
+    # 1. Replace full phenotype name with short name
+    Phenotype = MRI_pheno_all.full_name.r[Phenotype],
+    
+    # 3. Create GWAS_name as pheno_region
+    GWAS_name = paste0("global_", Phenotype))
+
+vw2023.regional.readable = vw2023.regional %>%
+  mutate(
+    # 1. Replace full phenotype name with short name
+    phenotype = MRI_pheno_all.full_name.r[phenotype],
+    
+    # 2. Replace region number with region name
+    region = vw2023.regional.conversion_table$`Region name`[
+      match(region, vw2023.regional.conversion_table$`Region number`)
+    ],
+    
+    # 3. Create GWAS_name as pheno_region
+    GWAS_name = paste0("regional_", phenotype, "_", region))
+
+vw2023 = full_join(vw2023.global.readable, vw2023.regional.readable)
+vw2023.unique = unique(vw2023$SNP)
+
+# For GWAS Catalogue: Re:Format
+GWAS_catalogue_neuroimaging_measurement = read_tsv(here("script_manuscript/GWAS_catalogue_EFO_0004346_associations_export.tsv"))
+GWAS_catalogue_neuroimaging_measurement = GWAS_catalogue_neuroimaging_measurement %>% filter(!grepl("Alzheimer", traitName, ignore.case = TRUE)) # remove conditioned
+GWAS_catalogue_neuroimaging_measurement= GWAS_catalogue_neuroimaging_measurement %>% 
+  mutate(riskAllele = ifelse(grepl("^rs", riskAllele), sub("-.*", "", riskAllele), sub("^chr", "", sub("-", "_", riskAllele)))) 
+GWAS_catalogue.unique = unique(GWAS_catalogue_neuroimaging_measurement$riskAllele)
+# Note. GWAS Catalogue does not hold REF allele info only ALT allele info. Anything without rsid will not be put in account, dropped 143 rows.
+
+# For ENIGMA - CLSA-PheWeb: Tophits: 1000 SNPs with the most significant P aaosications, Consider for at least P<10e-6, only top hits within 500kb shown
+ENIGMA_imaging_GWAS_tophit = fread(here("script_manuscript/ENIGMA_CLAS_PheWeb_phenotype_tab_data.csv"))
+ENIGMA_imaging_GWAS_tophit.brain = ENIGMA_imaging_GWAS_tophit %>% filter(!grepl("Heart|Retinal", category, ignore.case = TRUE)) # remove non-brain-measures
+ENIGMA_imaging_GWAS_tophit.brain = ENIGMA_imaging_GWAS_tophit.brain %>%
+  mutate(rsid_findunique = case_when(
+    grepl("\\(rs\\S+\\)", variantName) ~ sub(".*\\((rs\\S+)\\).*", "\\1", variantName),
+    TRUE ~ gsub(":\\s*", ":", variantName) %>%
+             gsub("\\s*/\\s*", "_", .) %>%
+             gsub("\\s+", "_", .)
+  )) %>% select(phenocode, rsid_findunique)
+
+# For ENIGMA - CLSA-PheWeb: Top rsid per phenotype
+ENIGMA_imaging_GWAS_phenotype = fread(here("script_manuscript/ENIGMA_CLAS_PheWeb_top_hit_phenotype_data.csv"))
+ENIGMA_imaging_GWAS_phenotype.brain = ENIGMA_imaging_GWAS_phenotype %>% filter(!grepl("Heart|Retinal", category, ignore.case = TRUE)) # remove non-brain-measures
+ENIGMA_imaging_GWAS_phenotype.brain = ENIGMA_imaging_GWAS_phenotype.brain %>%
+  filter(pval < 5e-8) %>% # must be GWS
+  mutate(rsid_findunique = case_when(
+    grepl("\\(rs\\S+\\)", variantName) ~ sub(".*\\((rs\\S+)\\).*", "\\1", variantName),
+    TRUE ~ gsub(":\\s*", ":", variantName) %>%
+             gsub("\\s*/\\s*", "_", .) %>%
+             gsub("\\s+", "_", .)
+  )) %>% select(phenocode, rsid_findunique)
+
+ENIGMA = full_join(ENIGMA_imaging_GWAS_phenotype.brain, ENIGMA_imaging_GWAS_tophit.brain)
+ENIGMA.unique = unique(ENIGMA$rsid_findunique)
+
+# BIG40
+BIG40 = fread(here("script_manuscript/Big40_top_hits.tsv"))
+BIG40 = BIG40 %>%
+  filter(pval < 5e-8) %>%
+  # grab first rsid in the string if it exist, otherwise generate variant id
+  mutate(rsid_findunique = ifelse(rsids == "" | is.na(rsids), 
+                                  paste0(chrom, ":", pos, "_", ref, "_", alt),
+                                  sub(",.*", "", rsids) %>% trimws())) %>% select(phenocode, rsid_findunique)
+BIG40.unique = unique(BIG40$rsid_findunique)
+
+ALL.unique = unique(c(GWAS_catalogue.unique, ENIGMA.unique, vw2023.unique, BIG40.unique))
+sum(!SF2_and_SF3.clump.r20.1.unique %in% ALL.unique) # 22,564
+sum(!UKB_r20.8.clump.unique %in% ALL.unique) # 37,530
+```
+```{r generate Supplement table 6: Unique loci across top hit external neuroimaging GWAS}
+# Pre-compute trait mappings
+ALL.clump.unique = unique(c(SF2_and_SF3.clump.r20.1.unique, UKB_r20.8.clump.unique))
+
+## vw2023
+vw2023.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    vw2023 %>%
+      group_by(SNP) %>%
+      summarise(vw2023_traits = paste(unique(GWAS_name), collapse = ", ")),
+    by = "SNP"
+  )
+
+## GWAS Catalogue
+## Note: GWAS Catalogue does not hold REF allele info, only ALT allele info.
+## Anything without rsid will not be accounted for (~143 rows dropped).
+GWAS_cat.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    GWAS_catalogue_neuroimaging_measurement %>%
+      filter(startsWith(riskAllele, "rs")) %>%
+      group_by(riskAllele) %>%
+      summarise(GWAS_cat_traits = paste(unique(traitName), collapse = ", ")),
+    by = c("SNP" = "riskAllele")
+  )
+
+## ENIGMA
+ENIGMA.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    ENIGMA %>%
+      group_by(rsid_findunique) %>%
+      summarise(ENIGMA_traits = paste(unique(phenocode), collapse = ", ")),
+    by = c("SNP" = "rsid_findunique")
+  )
+
+## BIG40
+BIG40.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    BIG40 %>%
+      group_by(rsid_findunique) %>%
+      summarise(BIG40_traits = paste(unique(phenocode), collapse = ", ")),
+    by = c("SNP" = "rsid_findunique")
+  )
+
+## UKB r2<0.1
+UKB_r20.1.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    UKB_SF2.clump.r20.1 %>%
+      mutate(GWAS_name = ifelse(is.na(region), 
+                                paste(MRI_scale, MRI_pheno, sep = "_"),
+                                paste(MRI_scale, MRI_pheno, region, sep = "_"))) %>%
+      group_by(SNP) %>%
+      summarise(UKB_r20.1_traits = paste(unique(GWAS_name), collapse = ", ")),
+    by = "SNP"
+  )
+
+## meta r2<0.1
+meta_r20.1.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    meta_SF3.clump.r20.1 %>%
+      mutate(GWAS_name = ifelse(is.na(region), 
+                                paste(MRI_scale, MRI_pheno, sep = "_"),
+                                paste(MRI_scale, MRI_pheno, region, sep = "_"))) %>%
+      group_by(SNP) %>%
+      summarise(meta_r20.1_traits = paste(unique(GWAS_name), collapse = ", ")),
+    by = "SNP"
+  )
+
+## UKB r2<0.8
+UKB_r20.8.trait = ALL.clump.unique %>%
+  as_tibble() %>%
+  rename(SNP = value) %>%
+  left_join(
+    UKB_r20.8_clump %>%
+      group_by(SNP) %>%
+      summarise(UKB_r20.8_traits = paste(unique(GWAS_name), collapse = ", ")),
+    by = "SNP"
+  )
+
+# Join all trait mappings onto main df
+SF6.df = data.frame(
+  rsid = ALL.clump.unique,
+  # clump
+  In_UKB_clump_r2_0.1 = ALL.clump.unique %in% UKB_SF2.clump.r20.1$SNP,
+  In_UKB_clump_r20.8 = ALL.clump.unique %in% UKB_r20.8.clump.unique,
+  In_meta_clump_r2_0.1 = ALL.clump.unique %in% meta_SF3.clump.r20.1$SNP,
+  # pheno
+  In_vw2023 = ALL.clump.unique %in% vw2023.unique,
+  In_GWAS_cat_EFO_004346 = ALL.clump.unique %in% GWAS_catalogue.unique,
+  In_ENIGMA_CLSA_PheWeb_brain = ALL.clump.unique %in% ENIGMA.unique,
+  IN_BIG40 = ALL.clump.unique %in% BIG40.unique) %>%
+  left_join(UKB_r20.1.trait,   by = c("rsid" = "SNP")) %>%
+  left_join(UKB_r20.8.trait,   by = c("rsid" = "SNP")) %>%
+  left_join(meta_r20.1.trait,  by = c("rsid" = "SNP")) %>%
+  left_join(vw2023.trait,      by = c("rsid" = "SNP")) %>%
+  left_join(GWAS_cat.trait,    by = c("rsid" = "SNP")) %>%
+  left_join(ENIGMA.trait,      by = c("rsid" = "SNP")) %>%
+  left_join(BIG40.trait,       by = c("rsid" = "SNP"))
+  
+
+write.table(SF6.df, here("result_manuscript/ST6_clumped_loci_overlap_across_neuroimaging_GWAS_external.txt"), quote = F, row.names = F, sep = "\t")
+```
+```{r concordance between 2026 and 2023 independent loci }
+SNP2023_vs_2026_concordance = SF6.df %>%
+  filter(In_vw2023 == TRUE) %>%
+  mutate(
+    split_UKB_r20.1  = strsplit(UKB_r20.1_traits, ", "),
+    split_meta_r20.1 = strsplit(meta_r20.1_traits, ", "),
+    split_UKB_r20.8  = strsplit(UKB_r20.8_traits, ", "),
+    split_vw2023     = strsplit(vw2023_traits, ", ")
+  ) %>%
+  mutate(
+    any_overlap = mapply(function(a, b, c, v) 
+      any(c(a, b, c) %in% v),
+      split_UKB_r20.1, split_meta_r20.1, split_UKB_r20.8, split_vw2023)
+  )
+
+SNP2023_vs_2026_concordance %>% summarise(
+  yes = sum(any_overlap,  na.rm = TRUE),
+  no  = sum(!any_overlap, na.rm = TRUE)
+)
+```
+## Supplement table 7: rg against previous and external GWAS
+```{r rg against previous and external GWAS: vw2023, subcortical volume, tract}
+rg_comparison.name = list.files(here("script_manuscript/rg_UKB_vs_past_MRI"), pattern = ".log")
+rg_comparison.name = gsub(".log", "", rg_comparison.name)
+
+rg_comparison.path = list.files(here("script_manuscript/rg_UKB_vs_past_MRI"), pattern = ".log", full.names = TRUE)
+rg_comparison.table = ldsc_rg_batch_read(rg_comparison.path, rg_comparison.name) %>%filter(!grepl("_tract_MD_", p1_base))
+
+rg_MRI_2026_vs_MRI_2023 = fread(glue("{path_yg}SSHscript/old_vs_new_ldsc/rg_global_ABCD_vs_UKB.txt"), drop = "V1")
+rg_MRI_2026_vs_MRI_2023$p2_base = gsub("_as_pheno[0-9]+", "", rg_MRI_2026_vs_MRI_2023$p2_base)
+rg_MRI_2026_vs_MRI_2023$p1_base = gsub("ABCD_", "", rg_MRI_2026_vs_MRI_2023$p1_base)
+
+rg_MRI_2026_vs_MRI_2023 = rg_MRI_2026_vs_MRI_2023 %>% filter(p1_base == p2_base)
+ST7 = full_join(rg_comparison.table, rg_MRI_2026_vs_MRI_2023)
+
+write.table(ST7, here("result_manuscript/SF7_rg_comparison_across_external_and_past_MRI_GWAS.txt"), quote = F, row.names = F)
+```
+
+## Supplementary Figure 1: Concordance Rate by MRI Phenotype and genetic correlation with different external neuroimaging GWAS
+```{r Supplementary Figure 1: Concordance Rate by MRI Phenotype}
+concor.pval <- beta_concordance_rate.by_MRI_pheno.pct.df.t_test$p.value
+concor.means <- beta_concordance_rate.by_MRI_pheno.pct.df.t_test$estimate
+concor.annotate = glue(
+  "t-test p = {round(concor.pval, digits = 6)}
+  Mean DTI-based IDP = {round(concor.means['mean in group DTI'], 1)}% 
+  Mean STR-based IDP = {round(concor.means['mean in group STR'], 1)}%")
+
+s.fig1 = ggplot(beta_concordance_rate.by_MRI_pheno.pct.df,
+       aes(x = MRI_pheno, y = concordance.pct, fill = MRI_pheno)) +
+  geom_col(color = "black", linewidth = 0.3) +
+  scale_fill_manual(values = MRI_pheno_all.colors, name = "MRI Phenotypes") +
+  facet_wrap(~MRI_type, scales = "free_x") +
+  coord_cartesian(ylim = c(50, 100)) +
+  xlab("") +  
+  ggtitle(concor.annotate) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()) +
+  ylab("Concordance (%)")
+
+p.Q = ggplot(EWS.sig.UKB_in_ABCD, aes(x = Q)) +
+  geom_histogram(fill = "steelblue", color = "black", linewidth = 0.3, bins = 30) +
+  theme_classic() +
+  labs(title = "Distribution of Q", x = "Q", y = "Count")
+
+p.I = ggplot(EWS.sig.UKB_in_ABCD, aes(x = I)) +
+  geom_histogram(fill = "tomato", color = "black", linewidth = 0.3, bins = 30) +
+  theme_classic() +
+  labs(title = "Distribution of I", x = "I", y = "Count")
+
+combined.fig = (p.Q | p.I) / s.fig1 +
+  plot_layout(heights = c(1, 2)) +
+  plot_annotation(tag_levels = "A")
+
+ggsave(here("result_manuscript/SF3.1_concor_by_phenotype.png"), plot = combined.fig, width = 15, height = 8, dpi = 300, units = "in")
+ggsave(here("result_manuscript/SF3.1_concor_by_phenotype.pdf"), plot = combined.fig, width = 15, height = 8, dpi = 300, units = "in")
+```
+
+# Section 3: Widespread Pleitropy and regions of specificity
+Note. Some data table called in this section were generated from UKB_hyprcoloc_edited_v2.Rmd
+```{r Section 3 specific library}
+library(ggrepel)
+```
+```{r Figure 4.3.3A - Manhattan Plot on Genetic Pleitropy Across MRI Modalities}
+# Read in GWAS filtered with p < 1e-5
+tract.list.df = readRDS(here("script_manuscript/manhattan_component/tract.list.df.rds"))
+subcor.list.df = readRDS(here("script_manuscript/manhattan_component/subcor.list.df.rds"))
+global.list.df = readRDS(here("script_manuscript/manhattan_component/global.list.df.rds"))
+regional.list.df = readRDS(here("script_manuscript/manhattan_component/regional.list.df.rds"))
+
+# Condense too sig.SNPs 
+
+MRI_GWAS_sig.snp = list(
+  tract    = tract.list.df,
+  subcor   = subcor.list.df,
+  global   = global.list.df,
+  regional = regional.list.df
+) %>%
+  imap_dfr(
+    ~ .x %>%
+      map(~ mutate(.x, CHR = as.character(CHR))) %>%
+      bind_rows(.id = "GWAS_name")
+  )
+
+MRI_GWAS_sig.snp.EWS = MRI_GWAS_sig.snp %>%
+  mutate(
+    CHR = replace_na(CHR, "X"),
+    chr_order = if_else(CHR == "X", 23L, as.integer(CHR))
+  ) %>%
+  filter(P < 4.65e-11) %>%
+  group_by(SNP) %>%
+  mutate(
+    n_pheno = n_distinct(GWAS_name),
+    log10P = -log10(P)
+  ) %>%
+  ungroup() %>%
+  arrange(chr_order, POS)
+
+# Manhattan plot stats
+chr_lengths = MRI_GWAS_sig.snp.EWS %>%
+  group_by(CHR, chr_order) %>%
+  summarise(
+    chr_len = max(POS),
+    .groups = "drop"
+  ) %>%
+  arrange(chr_order) %>%
+  mutate(
+    cum_start = cumsum(lag(chr_len + 3e7, default = 0)) # 3e7 is gap number between chromosomes, if needed add up
+  )
+
+F4.3.3.df = MRI_GWAS_sig.snp.EWS %>%
+  left_join(chr_lengths %>% select(CHR, cum_start), by = "CHR") %>%
+  mutate(
+    cum_pos = POS + cum_start,
+    log10P = ifelse(log10P>200, 200, log10P)) %>%
+  arrange(chr_order, POS)
+
+chr_mids = F4.3.3.df %>%
+  group_by(CHR, chr_order) %>%
+  summarise(
+    mid = (min(cum_pos) + max(cum_pos)) / 2,
+    .groups = "drop"
+  ) %>%
+  arrange(chr_order)
+
+# Plot F4.3.3
+F4.3.3A = ggplot(F4.3.3.df, aes(x = cum_pos, y = log10P, colour = n_pheno)) +
+  geom_point(size = 0.8, alpha = 0.8) +
+  annotate("text", x = chr_mids$mid, y = 0, label = chr_mids$CHR, size = 2.5, fontface = "bold", family = "Arial") +
+  scale_colour_viridis_c(option = "plasma", name = "N phenotypes") +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(limits = c(-5, 200), name = expression(-logP)) +
+  theme_classic() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+ggsave(
+  here("result_manuscript/F3.3A_Manhattan_across_all_MRI_GWAS.pdf"),
+  F4.3.3A,
+  width = 15, height = 3,
+  device = cairo_pdf, bg = "white")
+
+ggsave(
+  here("result_manuscript/F3.3A_Manhattan_across_all_MRI_GWAS.png"),
+  F4.3.3A,
+  width = 15, height = 3,
+  dpi = 600, bg = "white")
+```
+```{r Generation of Specificity and Pleitropic Rankings}
+entropy <- function(x, n_max) {
+  p <- table(x) / length(x)
+  round((-sum(p * log(p))) / log(n_max), 3)
+}
+
+# read and format table
+LD_summary = fread("/rds/user/yg330/hpc-work/pgs_img_2/Rscript/hyprcoloc/GWAS_coloc_LD_block_list_v2.txt") %>%
+  rowwise() %>%
+  mutate(# reformatt GWAS.list to approperiate supplementary table format
+    traits = list(
+      str_split(GWAS_list, ",")[[1]] %>%
+        gsub("SubCorVol", "SubCor_Vol", ., fixed = TRUE) %>%
+        gsub("CC_", "CC.", ., fixed = TRUE) %>%
+        gsub("_l", ".l", ., fixed = TRUE) %>%
+        gsub("_r", ".r", ., fixed = TRUE) %>%
+        gsub("Mid_", "Mid.", ., fixed = TRUE)),
+    
+    scale = list(str_extract(unlist(traits), "^[^_]+")),
+    pheno = list(str_extract(str_remove(unlist(traits), "^[^_]+_"), "^[^_]+")),
+    region = list(str_remove(unlist(traits), "^[^_]+_[^_]+_")),
+    
+    n_traits = length(unlist(traits)),
+    n_scale = n_distinct(unlist(scale)),
+    n_pheno_type = n_distinct(unlist(pheno)),
+    n_region = n_distinct(unlist(region)),
+    
+    scale_entropy = entropy(unlist(scale), n_max = 4),
+    pheno_entropy = entropy(unlist(pheno), n_max = 13),
+    region_entropy = entropy(unlist(region), n_max = 233)) %>%
+  ungroup() %>%
+  select(chr, start, end, locus, GWAS_list, 
+         n_traits, n_scale, n_pheno_type, n_region, 
+         scale_entropy, pheno_entropy, region_entropy)%>%
+  mutate(# Adjust by n_trait size to find unexpectedly pleitropic and specific LD blocks
+    scale_specificity = log10(n_traits) * (1 - scale_entropy),
+    pheno_specificity = log10(n_traits) * (1 - pheno_entropy),
+    region_specificity = log10(n_traits) * (1 - region_entropy),
+    specificity_score = 0.6 * region_specificity + 0.3 * pheno_specificity + 0.1 * scale_specificity,
+    pleiotropy_score =log10(n_traits) * (0.6 * region_entropy + 0.3 * pheno_entropy + 0.1 * scale_entropy))
+```
+```{r Figure 4.3.3B - Bar plot for Replicating Most extreme p values}
+plot_df = LD_summary %>%
+  pivot_longer(c(specificity_score, pleiotropy_score), names_to = "type", values_to = "score") %>%
+  mutate(
+    type = recode(type, specificity_score = "Specificity", pleiotropy_score  = "Pleiotropy")) %>%
+  slice_max(score, n = 10, by = type)
+
+chr_counts = plot_df %>%
+  count(chr, name = "n_bar") %>%
+  complete(chr = 1:22, fill = list(n_bar = 0)) %>%
+  mutate(
+    width = pmax(n_bar, 1),
+    start = cumsum(lag(width + .5, default = 0)),
+    mid = start + width / 2
+  )
+
+plot_df = plot_df %>%
+  left_join(
+    select(chr_counts, chr, start_chr = start),
+    by = "chr"
+  ) %>%
+  mutate(
+    rank_chr = dense_rank(locus),
+    x = start_chr + rank_chr,
+    label = sprintf("CHR%s:L%s (%sT)", chr, locus, n_traits),
+    .by = chr
+  )
+
+x_max = max(chr_counts$start + chr_counts$width)
+
+panel_LD = ggplot(plot_df, aes(x, score, fill = type)) +
+  geom_col(width = .8) +
+  geom_text(
+    aes(label = label),
+    angle = 90,
+    hjust = -.09,
+    size = 2.4
+  ) +
+  scale_fill_manual(
+    values = c(
+      Specificity = "#2166AC",
+      Pleiotropy  = "#B2182B"
+    )
+  ) +
+  scale_x_continuous(
+    breaks = chr_counts$mid,
+    labels = chr_counts$chr,
+    limits = c(0, x_max),
+    expand = expansion(mult = c(.01, .01))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(.02, .25))
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(
+    x = "Chromosome",
+    y = "Pleiotropy / Specificity Score",
+    fill = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    panel.grid = element_blank(),
+    axis.text.x = element_text(face = "bold", size = 10),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    plot.margin = margin(30, 20, 10, 10)
+  )
+
+panel_LD
+
+ggsave(
+  here("result_manuscript/F3.3B_Top_Pleiotropy_Specificity_LD_Blocks.png"),
+  panel_LD,
+  width = 15,
+  height = 5,
+  dpi = 600
+)
+
+ggsave(
+  here("result_manuscript/F3.3B_Top_Pleiotropy_Specificity_LD_Blocks.pdf"),
+  panel_LD,
+  width = 15,
+  height = 5,
+  dpi = 600
+)
+```
+# Section 4: Co-localisation, Clustering and Network Analysis for identifying latent structures
+```{r Section 4 Specific library and functions}
+# For Upset Graph
+library(UpSetR)
+library(uwot)
+library(igraph)
+```
+```{r Figure 4.3.4A and B: UpSet hyprcoloc result Visualisation}
+parse_traits_long = function(df) {
+  df %>%
+    mutate(
+      traits = str_replace_all(traits, "SubCorVol", "SubCor_Vol"),
+      traits = str_replace_all(traits, "CC_", "CC."),
+      traits = str_replace_all(traits, "Mid_", "Mid."),
+      traits = str_replace_all(traits, "_l\\b", ".l"),
+      traits = str_replace_all(traits, "_r\\b", ".r")
+    ) %>%
+    mutate(row_id = row_number()) %>%
+    separate_rows(traits, sep = ",") %>%
+    mutate(traits = str_trim(traits)) %>%
+    extract(
+      traits,
+      into = c("scale", "modality", "region"),
+      regex = "^(global|regional|SubCor|tract)_([A-Za-z0-9]+)_?(.*)$",
+      remove = FALSE) %>%
+    mutate(region = na_if(region, ""))}
+
+hyprcoloc.95cred_set = fread(here("meta_MRI_post_GWAS/supplement_results/hyprcoloc_95creditset_v2.txt"))
+hyprcoloc.df <- parse_traits_long(hyprcoloc.95cred_set)
+
+pheno_wide = hyprcoloc.df %>%
+  distinct(row_id, modality) %>%
+  mutate(value = 1L) %>%
+  pivot_wider(
+    names_from = modality,
+    values_from = value,
+    values_fill = 0
+  ) %>%
+  select(-row_id) %>%
+  mutate(across(everything(), as.integer))
+
+combo_id = apply(pheno_wide, 1, paste, collapse = "_")
+combo_counts = table(combo_id)
+keep_rows = as.numeric(combo_counts[combo_id]) > 2
+pheno_wide_filtered = pheno_wide[keep_rows, ]
+
+
+F4.3.4A = UpSetR::upset(
+  as.data.frame(pheno_wide_filtered),
+  order.by = "freq",
+  main.bar.color = "steelblue",
+  sets.bar.color = "darkorange",
+  text.scale = 1.3,
+  mainbar.y.label = "Colocalising trait combinations",
+  sets.x.label = "Loci per phenotype")
+
+
+# For regions
+region_membership <- hyprcoloc.df %>%
+  filter(!is.na(region)) %>%
+  distinct(row_id, region)
+
+region_wide = region_membership %>%
+  mutate(value = 1L) %>%
+  pivot_wider(
+    names_from = region,
+    values_from = value,
+    values_fill = 0
+  ) %>%
+  select(-row_id) %>%
+  mutate(across(everything(), as.integer))
+
+# Keep combinations occurring > 2 times
+combo_id = apply(region_wide, 1, paste, collapse = "_")
+combo_counts = table(combo_id)
+region_wide_filtered = region_wide[as.numeric(combo_counts[combo_id]) > 2,]
+
+F4.3.4B = UpSetR::upset(as.data.frame(region_wide_filtered),
+  order.by = "freq",
+  main.bar.color = "steelblue",
+  sets.bar.color = "darkorange",
+  mainbar.y.label = "Colocalising region combinations",
+  sets.x.label = "Loci per region")
+
+
+```
+Generation of genetic correlation Matrix as shown in MRI_within_rg_matrix_construction.Rmd
+```{r igraph network construction}
+# read in data, df formatting and clean-up
+rg_network.df = fread(here("script_manuscript/network_clustering_component/rg_matrix.QCed.formatted.txt")) %>% 
+  select(p1_base, p2_base, rg, p) %>% 
+  mutate(rg = pmax(pmin(rg, 1), -1), p_fdr = p.adjust(p, method = "fdr")) # some rg > 1 correct them to 1
+
+rg_network.df = sup_table_name_cleaner(rg_network.df, c("p1_base", "p2_base"))
+
+# define edge and node-associated properties
+
+## Edge: rg and distance
+rg_edge = rg_network.df %>% filter(p_fdr < 0.05) %>% # filter out weak fdr p values
+  select(p1_base, p2_base, rg) %>% 
+  rename(from = p1_base, to = p2_base)
+
+### add between region distance
+geo_distance.df = as.matrix(fread(here("script_manuscript/network_clustering_component/geodesic_distance_HCP.csv"), header = TRUE))[1:180,1:180]
+geo_distance.colnames = fread(here("script_manuscript/network_clustering_component/geodesic_distance_HCP_colnames.csv"))
+colnames(geo_distance.df) = geo_distance.colnames$region
+rownames(geo_distance.df) = geo_distance.colnames$region
+
+rg_edge[, from_region := sub("^regional_[^_]+_", "", from)]
+rg_edge[, to_region   := sub("^regional_[^_]+_", "", to)]
+rg_edge[, geo_distance := NA_real_]
+idx = grepl("^regional_", rg_edge$from) & grepl("^regional_", rg_edge$to)
+rg_edge[idx, geo_distance := geo_distance.df[cbind(from_region, to_region)]]
+
+rg_edge = rg_edge %>% mutate(weight = (rg + 1) / 2) %>% select(from, to, rg, weight, geo_distance)
+
+## Node: MRI categories and h2
+rg_node = fread(here("result_manuscript/ST3_UKB_and_meta_h2.txt")) %>% 
+  mutate(name = paste(MRI_scale, MRI_pheno, region, sep = "_"), name = gsub("_NA", "", name)) %>% 
+  select(name, MRI_scale, MRI_pheno, region, UKB_h2)
+
+# network construction
+rg_network = graph_from_data_frame(d = rg_edge, vertices = rg_node, directed = FALSE)
+saveRDS(rg_network, here("script_manuscript/network_clustering_component/rg_network.Rds"))
+```
+```{r leiden clustering and investigation on key network properties}
+# leiden clustering
+resolutions = seq(0.1, 2, by = 0.05)
+
+leiden.opt = sapply(resolutions, function(res) {
+  cl = cluster_leiden(rg_network, weights = E(rg_network)$rg, objective_function = "modularity", resolution_parameter = res)
+  modularity(rg_network, membership(cl))})
+
+best_res = resolutions[which.max(leiden.opt)]
+
+leiden_cl = cluster_leiden(rg_network, weights = E(rg_network)$rg, objective_function = "modularity", resolution = 0.5) # this was determined step-wise gridsearch
+sizes(leiden_cl)
+leiden_membership.df = tibble(
+  Trait = names(membership(leiden_cl)),
+  ld_cl = factor(membership(leiden_cl)))
+
+# Hierarchical Clustering
+rg_matrix = as.matrix(as_adjacency_matrix(rg_network, attr = "weight", sparse = FALSE)) # retrieve transformed rg [-1,1] to [0,1] as matrix
+hc = hclust(as.dist(1 -rg_matrix), method = "average") # Change adjacency matrix to distance, average linked
+hc_cl = dynamicTreeCut::cutreeDynamic(dendro = hc, distM = as.matrix(as.dist(1 -rg_matrix)), minClusterSize = 233.2) 
+hc_membership.df = data.frame(Trait = colnames(rg_matrix), hc_cl = hc_cl)
+
+# Note on minClusterSize: Force big clusters, needs to include at least 10% of the total nodes per cluster (2332*0.1). Other no clusters will be formed.
+```
+```{r UMAP Visualisation}
+umap = umap2(1 - rg_matrix, n_neighbors = 50, min_dist = 0.05) # UMAP
+
+# UMAP data table construction
+umap.df = as.data.frame(umap) %>% 
+  rename(x = V1, y = V2) %>% 
+  mutate(GWAS = rownames(.), GWAS_name = rownames(.)) %>% 
+  sup_table_formatter()
+
+umap.df = umap.df %>% full_join(leiden_membership.df, join_by("GWAS" == "Trait")) %>% full_join(hc_membership.df, join_by("GWAS" == "Trait"))
+
+umap.df = umap.df %>% 
+  mutate(
+    SubCor_group = case_when(
+      !str_detect(GWAS, "^SubCor_Vol") ~ NA_character_,
+      str_detect(GWAS, "^SubCor_Vol_CC.") ~ "Corpus Callosum",
+      str_detect(GWAS, "Ventricle|Vent$") ~ "Ventricles",
+      str_detect(GWAS, regex("Caudate|Accumbens|Putamen|Pallidum|Thalamus|Amygdala|Hippocampus|VentralDC", ignore_case = TRUE)) ~ "Deep Grey Matter",
+      str_detect(GWAS,regex("Brain.Stem|Cerebellum", ignore_case = TRUE)) ~ "Hindbrain", TRUE ~ "Other"))
+
+# For MRI_Scale
+UMAP.scale = umap.df %>%
+  {
+    ggplot() +
+      geom_point( # make sure global dots plotted last and visable
+        data = subset(., MRI_scale != "global"),
+        aes(x, y, colour = MRI_scale),
+        size = 1.5, alpha = 0.8
+      ) +
+      geom_point(
+        data = subset(., MRI_scale == "global"),
+        aes(x, y, colour = MRI_scale),
+        size = 1.5, alpha = 0.8
+      )} +
+  scale_color_manual(
+    values = c(
+      regional = "#FDBF6F",
+      global   = "#E31A1C",
+      tract    = "#CAB2D6",
+      SubCor   = "grey30"),
+    labels = c(
+      global   = "Glb",
+      regional = "Rgnl",
+      SubCor   = "SubB.Vol",
+      tract    = "WM.Tracts")) +
+  labs(
+    colour = "Region Types") +
+  theme_pubr() +
+  theme(legend.position = "bottom", legend.box = "vertical")
+
+# For MRI_pheno
+UMAP.pheno = umap.df %>% ggplot(aes(x,y,colour = MRI_pheno)) +
+  geom_point(size = 1.5, alpha = 0.8, position = position_jitter(width = 0.2, height = 0.2)) + 
+  scale_colour_manual(values = MRI_pheno_all.colors) +
+  theme_pubr() +
+   labs(colour = "MRI Modality")+
+  theme(legend.position = "bottom")
+
+# For ld_cl
+UMAP.leiden = umap.df %>% ggplot(aes(x,y,colour = ld_cl)) +
+  geom_point(size = 1.5, alpha = 0.8) + 
+  theme_pubr() +
+   labs(colour = "Leiden Clustering")+
+  theme(legend.position = "bottom")
+
+# For hc_cl
+UMAP.hc = umap.df %>% ggplot(aes(x,y,colour = as.character(hc_cl))) +
+  geom_point(size = 1.5, alpha = 0.8) + 
+  theme_pubr() +
+   labs(colour = "Hiearchical Clustering")+
+  theme(legend.position = "bottom")
+```
+```{r F4.3.5 Construction}
+# Individual graph tweaks 
+common_theme = theme(legend.position = "bottom", legend.box = "vertical", legend.title = element_text(size = 9), 
+                     legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm"), axis.title = element_blank())
+
+UMAP.scale = UMAP.scale + common_theme + guides(colour = guide_legend(order = 1))
+UMAP.pheno = UMAP.pheno + common_theme + guides(colour = guide_legend(order = 3))
+UMAP.hc = UMAP.hc + common_theme + guides(colour = guide_legend(order = 4))
+UMAP.leiden = UMAP.leiden + common_theme + guides(colour = guide_legend(order = 5))
+
+
+F4.3.5 = (UMAP.scale + UMAP.pheno + UMAP.hc + UMAP.leiden) + plot_layout(guides = "collect") + plot_annotation(tag_levels = "A")
+
+ggsave(
+  here("result_manuscript/F4.3.5A-D.png"),
+  plot = F4.3.5,
+  width = 11.8,
+  height = 5.6,
+  units = "in",
+  dpi = 600)
+
+ggsave(
+  here("result_manuscript/F4.3.5A-D.pdf"),
+  plot = F4.3.5,
+  width = 11.8,
+  height = 5.6,
+  units = "in",
+  dpi = 600)
+
+```
+```{r Statistical Analysis for Cortical Region: Effect of Geodistance and Clustering membership on rg}
+# include Leiden and Hierarchical clustering information
+rg.stat = rg_edge %>% 
+  left_join(umap.df %>% select(GWAS, ld_cl, hc_cl) %>% 
+              rename(from_ld = ld_cl, from_hc = hc_cl),by = c("from" = "GWAS")) %>%
+  left_join(umap.df %>%
+              select(GWAS, ld_cl, hc_cl) %>%
+              rename(to_ld = ld_cl, to_hc = hc_cl), by = c("to" = "GWAS")) %>%
+  mutate(same_ld = from_ld == to_ld, same_hc = from_hc == to_hc, 
+         ld_pair = paste(pmin(as.numeric(from_ld), as.numeric(to_ld)), 
+                         pmax(as.numeric(from_ld), as.numeric(to_ld)), sep = "-")) # find same cluster pair and different cluster pairs
+
+# average rg with same clustering
+rg.same = rg.stat %>%
+  group_by(same_ld) %>%
+  summarise(
+    mean_rg = mean(rg, na.rm = TRUE),
+    mean_abs_rg = mean(abs(rg), na.rm = TRUE)
+  )
+
+# average rg across all cluster pairing possible
+rg.pairs = rg.stat %>%
+  group_by(ld_pair) %>%
+  summarise(
+    mean_rg = mean(rg),
+    mean_abs_rg = mean(abs(rg))
+  ) %>%
+  arrange(desc(mean_abs_rg))
+
+# rg with geo_distance only
+rg_model.geo_dist = lm(rg ~ geo_distance , data = rg.stat)
+summary(rg_model.geo_dist)
+
+# absolute rg with geo_distance only
+rg_model.geo_dist.abs = lm(abs(rg) ~ geo_distance, data = rg.stat)
+summary(rg_model.geo_dist.abs)
+
+# absolute rg with geo_distance and same_ld [0/1]
+rg_model.geo_dist_same_ld.abs = lm(abs(rg) ~ geo_distance + same_ld, data = rg.stat)
+summary(rg_model.geo_dist_same_ld.abs)
+
+# absolute rg with ld pair considerations
+rg_model.geo_dist_ld_pair.abs = lm(abs(rg) ~ geo_distance + ld_pair, data = rg.stat)
+summary(rg_model.geo_dist_ld_pair.abs)
+
+anova(rg_model.geo_dist.abs, rg_model.geo_dist_same_ld.abs, rg_model.geo_dist_ld_pair.abs)
+```
+# Section 5: FLAMES and Enrichment Analysis
+```{r Section 5 specific library}
+library(circlize)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# find overlap for chord graphs
+find_overlap_matrix = function(df, group_var){
+  genes_by_group = df %>%
+    group_by(.data[[group_var]]) %>%
+    summarise(genes = list(unique(symbol)), .groups = "drop")
+
+  groups = genes_by_group[[group_var]]
+
+  mat = matrix(0, nrow = length(groups), ncol = length(groups), dimnames = list(groups, groups))
+
+  for(i in seq_along(groups)){
+    for(j in seq_along(groups)){
+      gi = genes_by_group$genes[[i]]
+      gj = genes_by_group$genes[[j]]
+      mat[i,j] <- length(intersect(gi, gj))
+    }
+  }
+
+  diag(mat) = 0
+  mat}
+
+MRI_family.colours = c(
+  "Macrostructural Morphology" = "#E64B35",
+  "White Matter Integrity"     = "#4DBBD5",
+  "Cortical Geometry"          = "#00A087",
+  "Water Diffusivity"          = "#3C5488",
+  "Cortical Thickness"         = "#F39B7F",
+  "Orientation Dispersion"     = "#8491B4")
+
+plot_chord = function(overlap.mat, grid.col = NULL){
+  # reset if plotted chord beforehand
+  circos.clear()
+  
+  circos.par(start.degree = 90, gap.after = rep(8, nrow(overlap.mat)), track.margin = c(0.01, 0.01))
+  
+  chordDiagram(overlap.mat, grid.col = grid.col, transparency = 0.4, annotationTrack = "grid", preAllocateTracks = 1)
+  
+  circos.trackPlotRegion(track.index = 1, panel.fun = function(x, y){
+    sector = get.cell.meta.data("sector.index")
+    xlim = get.cell.meta.data("xlim")
+    ylim = get.cell.meta.data("ylim")
+    
+    circos.text(mean(xlim), ylim[2], sector, 
+                facing = "bending.outside", niceFacing = TRUE, 
+                cex = 0.8, font = 2)}, 
+    bg.border = NA)
+  
+  circos.clear()
+}
+
+```
+## FLAMES
+FLAMES genes were prioritised through FLAMES_README.Rmd all bash scripts with "FLAMES_" prefix
+```{r write SF6: FLAMES genes, eval=FALSE, include=FALSE}
+FLAMES = list.files(here("meta_MRI_post_GWAS/UKB_FLAMES"), recursive = TRUE, pattern = "FLAMES_scores.pred", full.names = TRUE)
+
+FLAMES.pred.df = map_dfr(FLAMES, function(file) {
+  df = fread(file)
+  if (nrow(df) == 0) {
+    message("Skipping due to <75% cumulative precision: ", basename(dirname(file)))
+    return(NULL)}
+  df %>% mutate(source_file = basename(dirname(file)))})
+
+# Save supplement results:
+FLAMES.score.pred.df.formatted = FLAMES.pred.df %>% 
+  rename(phenotype = source_file) %>% 
+  select(phenotype, symbol, ensg, FLAMES_scaled, estimated_cumulative_precision) %>% 
+  sup_table_name_cleaner(col_name = "phenotype") %>% 
+  mutate(GWAS_name = phenotype) %>%
+  sup_table_formatter() %>%
+  select(phenotype, MRI_scale, MRI_pheno, region, symbol, ensg, FLAMES_scaled, estimated_cumulative_precision)
+
+write.table(FLAMES.score.pred.df.formatted, 
+            here("result_manuscript/SF8_FLAMES_gene_prioritisation_results.txt"),
+            quote = FALSE, row.names = FALSE)
+```
+```{r F4.3.6 Chord Graph on overlapping genes}
+# read and formatt FLAMES gene dataset
+FLAMES.score.pred.df.formatted = fread(here("result_manuscript/SF8_FLAMES_gene_prioritisation_results.txt"))
+FLAMES.unique = FLAMES.score.pred.df.formatted %>%
+  distinct(phenotype, MRI_scale, MRI_pheno, region, symbol)
+
+FLAMES.unique = FLAMES.unique %>%
+  mutate(
+    family = case_when(
+      MRI_pheno %in% c("SA","GMV","FI","IC") ~ "Macrostructural Morphology",
+      MRI_pheno %in% c("FA","ICVF") ~ "White Matter Integrity",
+      MRI_pheno %in% c("GC","MC") ~ "Cortical Geometry",
+      MRI_pheno %in% c("MD","ISOVF") ~ "Water Diffusivity",
+      MRI_pheno == "CT" ~ "Cortical Thickness",
+      MRI_pheno == "OD" ~ "Orientation Dispersion",
+      MRI_pheno == "Vol" &
+        region %in% c("choroid.plexus", "CSF", "Optic.Chiasm",
+                      "3rd.Ventricle", "4th.Ventricle", "Inf.Lat.Vent") ~ "Water Diffusivity",
+      MRI_pheno == "Vol" &
+        !region %in% c("choroid.plexus", "CSF", "Optic.Chiasm", 
+                       "3rd.Ventricle", "4th.Ventricle", "Inf.Lat.Vent") ~ "Macrostructural Morphology",
+      TRUE ~ NA_character_))
+
+# build overlap matrix
+scale.overlap_mat = find_overlap_matrix(FLAMES.unique, "MRI_scale")
+pheno.overlap_mat = find_overlap_matrix(FLAMES.unique, "MRI_pheno")
+family.overlap_mat = find_overlap_matrix(FLAMES.unique, "family")
+
+# chord plotting
+plot_chord(scale.overlap_mat)
+plot_chord(pheno.overlap_mat, MRI_pheno_all.colors)
+plot_chord(family.overlap_mat, MRI_family.colours)
+```
+## Cell Type+Timepoint+Location Enrichment Analysis
+```{r Pseudoblock Matrix Generation: WANG, eval=FALSE, include=FALSE}
+FLAMES.family = FLAMES.unique %>% distinct(symbol, family)
+
+Wang_human = list.files(here("script_manuscript/enrichment_component/celltype"), pattern = "Wang2024_Human", full.names = TRUE) 
+Wang_human_level2 = Wang_human[grepl("level2", basename(Wang_human))]
+
+# Generate pseudo-blocks
+wang_long = rbindlist(
+  lapply(Wang_human_level2, function(f){
+
+    dt = fread(f)
+    avg_dt = dt[, .(GENE, avg_expr = Average)] # find average expression value per file
+    
+    # remove Average column
+    dt[, Average := NULL]
+
+    # remove prefix/suffix
+    fname = basename(f)
+    meta = gsub("^\\d+_", "", fname)
+    meta = gsub("^Wang2024_Human_2024_", "", meta)
+    meta = gsub("_level2\\.txt$", "", meta)
+    
+    # Find brain part and developmental timepoint
+    parts = strsplit(meta, "_")[[1]]
+    timepoint = parts[1]
+    region = paste(parts[-1], collapse = "_")
+
+    long = melt(dt, id.vars = "GENE", variable.name = "celltype", value.name = "expr")
+    long = merge(long, avg_dt, by = "GENE")
+    long[, bin := paste(celltype, timepoint, region, sep = "_")]
+
+    long[, .(GENE, celltype, timepoint, region, bin, expr, avg_expr)]}), use.names = TRUE)
+
+# construct covars for glm modeling
+gene_covars = data.frame(GENE = unique(wang_long$GENE))
+
+# add gene symbol to ENSEMBL
+gene_map = AnnotationDbi::select(org.Hs.eg.db, keys = unique(wang_long$GENE), keytype = "ENSEMBL", columns = "SYMBOL")
+gene_covars = left_join(gene_covars, gene_map, by = c("GENE" = "ENSEMBL"))
+
+# add gene size
+ENSG.gene.loc = fread(glue("{path_vw.toolbox}magma/ENSG.gene.loc"))
+gene_size = ENSG.gene.loc %>% transmute(ENSEMBL = V1, Symbol = V5, gene_length = V4 - V3 + 1)
+
+gene_covars = gene_covars %>% 
+  left_join(gene_size, by = c("GENE" = "ENSEMBL")) %>%
+  mutate(log_length = log10(gene_length))
+
+# filter for gene symbol version that has most FLAMES gene overlap 
+for(fam in unique(FLAMES.family$family)){
+
+  fam_genes = FLAMES.family %>%
+    filter(family == fam) %>%
+    pull(symbol)
+  
+  # use Symbol from magma definition as they have more overlap with FLAMES gene
+  gene_covars[[paste0("is_", fam)]] = as.integer(gene_covars$Symbol %in% fam_genes)}
+
+colnames(gene_covars) = gsub(" ", "_", colnames(gene_covars))
+
+write.table(gene_covars, 
+            here("script_manuscript/enrichment_component/gene_covar_annotated.txt"),
+            quote = FALSE, row.names = FALSE)
+
+write.table(wang_long, 
+            here("script_manuscript/enrichment_component/psuedobulk_wang.txt"),
+            quote = FALSE, row.names = FALSE)
+```
+```{r Logistic Regression Modelling}
+wang_long = fread(here("script_manuscript/enrichment_component/psuedobulk_wang.txt"))
+gene_covars = fread(here("script_manuscript/enrichment_component/gene_covar_annotated.txt"))
+
+# set up for loop
+results = list()
+families = colnames(gene_covars)[grepl("is_", colnames(gene_covars))]
+
+for(fam in families){
+  for(current_bin in unique(wang_long$bin)){
+
+    bin_df = wang_long %>% 
+      filter(bin == current_bin) %>%
+      select(GENE, expr, avg_expr)
+
+    mdf = gene_covars %>% 
+      left_join(bin_df %>% select(GENE, expr, avg_expr), by = "GENE") %>%
+      mutate(rel_expr = expr - avg_expr) %>%
+      filter(
+        !is.na(log_length),
+        !is.na(expr),
+        !is.na(avg_expr))
+
+    fit = glm(mdf[[fam]] ~ rel_expr + log_length, family = binomial(), data = mdf)
+
+    cf = summary(fit)$coefficients
+
+    beta = cf["rel_expr", "Estimate"]
+    se   = cf["rel_expr", "Std. Error"]
+
+    z = beta / se
+    p = pnorm(z, lower.tail = FALSE) # only finds enrichment not depletion
+
+    results[[length(results) + 1]] =
+      data.frame(
+        family = fam,
+        bin = current_bin,
+        beta = beta,
+        se = se,
+        p = p)}}
+
+# reduce and format celltype result tables
+FLAMES.cell = bind_rows(results)
+
+FLAMES.cell = FLAMES.cell %>%
+  group_by(bin) %>%
+  mutate(p.fdr.bin = p.adjust(p, "fdr")) %>%
+  ungroup() %>%
+  group_by(family) %>%
+  mutate(p.fdr.family = p.adjust(p, "fdr")) %>%
+  ungroup() %>%
+  mutate(p.fdr = p.adjust(p, "fdr"))
+
+sig.FLAMES.cell = FLAMES.cell %>% filter(p < 0.05)
+
+regions = unique(wang_long$region)
+timepoints = unique(wang_long$timepoint)
+
+sig.FLAMES.cell = sig.FLAMES.cell %>%
+  mutate(
+    region = str_extract(bin, paste(regions, collapse = "|")),
+    timepoint = str_extract(bin, paste(timepoints, collapse = "|")),
+    celltype = bin %>% str_remove(paste0("_", timepoint, "_", region)))
+```
+```{r F4.3.7 Concentric circle plot for Cell type enrichment stratified by developmental stage and brain location}
+circle_sizes = c(FirstTrimester = 2, SecondTrimester = 4, ThirdTrimester = 6, Infancy = 8, Adolescence = 10)
+circle_colours <- c(
+  FirstTrimester = "#d73027",
+  SecondTrimester = "#fc8d59",
+  ThirdTrimester = "#fee090",
+  Infancy = "#91bfdb",
+  Adolescence = "#4575b4")
+
+region_order = c("Forebrain", "Telencephalon", "Neocortex", 
+                 "PrefrontalCortex", "VisualCortex", 
+                 "BrodmannArea9", "BrodmannArea10", "BrodmannArea17")
+
+celltype_order = c("Astrocyte", "Oligodendrocyte",
+                   "Cajal Retzius Cell", 
+                   "IPC EN", "IPC Glia", "Radial Glia")
+
+timepoint_order = c("FirstTrimester", "SecondTrimester", "ThirdTrimester", "Infancy", "Adolescence")
+
+FLAMES.celltype.plot = sig.FLAMES.cell %>% filter(p.fdr < 0.05) %>%
+  select(family, celltype, timepoint, region) %>% 
+  filter(!celltype %in% c("Unknown", "Vascular")) %>%
+  mutate(
+    family = gsub("is_", "", family),
+    family = gsub("_", " ", family),
+    celltype = gsub("_", " ", celltype),
+    celltype = gsub("glia", "Glia", celltype),
+    celltype = gsub("cell", "Cell", celltype),
+    circle_sizes = circle_sizes[timepoint],
+    circle_colours = circle_colours[timepoint],
+    timepoint = factor(timepoint, levels = timepoint_order),
+    region = factor(region, levels = region_order),
+    celltype = factor(celltype, levels = celltype_order)) %>%
+  arrange(desc(circle_sizes))
+
+# Circle plot
+F4.3.7 = ggplot(FLAMES.celltype.plot, aes(x = region, y = celltype)) +
+  geom_point(aes(size = timepoint, colour = timepoint),
+             shape = 1, stroke = 1.2) +
+  scale_size_manual(values = circle_sizes, name = "Developmental stage") +
+  scale_colour_manual(values = circle_colours, name = "Developmental stage") +
+  facet_wrap(~ family) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"),
+    axis.text.y = element_text(colour = "black"),
+    strip.background = element_blank(),
+    panel.grid.major.x = element_line(colour = "grey90",linewidth = 0.2),
+    panel.grid.major.y = element_line(colour = "grey90", linewidth = 0.2),
+    panel.grid.minor = element_blank()) +
+  labs(x = NULL, y = NULL)
+
+
+ggsave(
+  here("result_manuscript/F4.3.7.png"),
+  plot = F4.3.7,
+  width = 9,
+  height = 6,
+  units = "in",
+  dpi = 600)
+
+ggsave(
+  here("result_manuscript/F4.3.7.pdf"),
+  plot = F4.3.7,
+  width = 9,
+  height = 6,
+  units = "in",
+  dpi = 600)
+```
+```{r write ST7 sig.CellType Result}
+ST7_sig.celltype_Wang2025 = sig.FLAMES.cell %>% filter(p.fdr < 0.05) %>%
+  filter(!celltype %in% c("Unknown", "Vascular")) %>%
+  mutate(
+    family = gsub("is_", "", family),
+    family = gsub("_", " ", family),
+    celltype = gsub("_", " ", celltype),
+    celltype = gsub("glia", "Glia", celltype),
+    celltype = gsub("cell", "Cell", celltype))
+
+write.table(ST7_sig.celltype_Wang2025, here("result_manuscript/ST7_sig.celltype_Wang2025.txt"), quote = F, row.names = F)
+```
+
+## Gene-set Functional Analysis
+Done locally through Clusterprofiler.Rmd
+
+Done locally through Clusterprofiler, this is due to hpc environment do not have the required modules loaded. For scripts check ClusterProfiler_Enrichment.Rmd
+
+# Section 6: Autism gene enrichment
+```{r SFARI gene list and custom term2gene set up for MRI modality family}
+SFARI_gene.list = fread(here("script_manuscript/enrichment_component/SFARI-Gene_genes_07-12-2026release_09-10-2026export.csv"))
+
+# syndromic[0/1] = Known Syndrome with reported ASD gene, different from gene category syndromic which means other symptoms were associated with it (ID)
+# 1,2,3 = Strength of Confirmed ASD reports
+# Eagle = Higher means more ASD-specific than NDD-specific
+
+SFARI_gene.ASD_syndromic = SFARI_gene.list %>% filter(syndromic == 1, `gene-score` %in% c(1, 2)) # ASD Genes known for other syndromes
+SFARI_gene.ASD_confidence = SFARI_gene.list %>% filter(syndromic == 0, `gene-score` %in% c(1, 2)) # High-confidence ASD genes
+SFARI_gene.ASD_specific = SFARI_gene.list %>% filter(eagle >= 12) # ASD-specific genes
+SFARI_gene.ASD_specific.nosyndrome = SFARI_gene.list %>% filter(syndromic == 0, eagle >= 12) # non-syndromic ASD-specific genes
+
+SFARI_gene.list.cat = list(
+  All = SFARI_gene.list, Syndromic = SFARI_gene.ASD_syndromic, HighConfidence = SFARI_gene.ASD_confidence,
+  HighEagle = SFARI_gene.ASD_specific, HighEagle_NoSyndrome = SFARI_gene.ASD_specific.nosyndrome)
+
+# Build custom gene-set for over-representation test
+FLAMES_gene_results = fread(here("result_manuscript/SF8_FLAMES_gene_prioritisation_results.txt"))
+
+FLAMES_gene_results.f = FLAMES_gene_results %>%
+  mutate(
+    family = case_when(
+      MRI_pheno %in% c("SA","GMV","FI","IC") ~ "Macrostructural Morphology",
+      MRI_pheno %in% c("FA","ICVF") ~ "White Matter Integrity",
+      MRI_pheno %in% c("GC","MC") ~ "Cortical Geometry",
+      MRI_pheno %in% c("MD","ISOVF") ~ "Water Diffusivity",
+      MRI_pheno == "CT" ~ "Cortical Thickness",
+      MRI_pheno == "OD" ~ "Orientation Dispersion",
+      MRI_pheno == "Vol" &
+        region %in% c("choroid.plexus", "CSF", "Optic.Chiasm",
+                      "3rd.Ventricle", "4th.Ventricle", "Inf.Lat.Vent") ~ "Water Diffusivity",
+      MRI_pheno == "Vol" &
+        !region %in% c("choroid.plexus", "CSF", "Optic.Chiasm", 
+                       "3rd.Ventricle", "4th.Ventricle", "Inf.Lat.Vent") ~ "Macrostructural Morphology",
+      TRUE ~ NA_character_))
+
+MRI_modality.family2gene = FLAMES_gene_results.f %>%
+  select(family, ensg) %>%
+  distinct()
+
+MRI_modality.family2gene.all = MRI_modality.family2gene %>% mutate(family = "MRI") %>% distinct()
+
+# background genes
+FLAMES_background = fread(glue("{path_vw.toolbox}FLAMES/16_Feb_2021_gene_loc.txt"))
+```
+```{r ORA:fisher test function}
+gene.ORA = function(sfari_genes, family2gene, universe){
+  N = length(universe)
+  K = sum(universe %in% sfari_genes)
+  
+  family2gene %>% distinct(family, ensg) %>% 
+    group_by(family) %>%
+    summarise(
+      family_size = n(),
+      overlap = sum(ensg %in% sfari_genes),
+      overlap_genes = paste(ensg[ensg %in% sfari_genes],collapse = ";"),
+      
+      GeneRatio = paste0(overlap, "/", K),
+      BgRatio = paste0(family_size, "/", N),
+      FoldEnrichment = (overlap / K) / (family_size / N),
+  
+      p = fisher.test(matrix(c(overlap, K - overlap, family_size - overlap, N - K - family_size + overlap), nrow = 2),
+                      alternative = "greater")$p.value,
+      OR = fisher.test(matrix(c(overlap, K - overlap, family_size - overlap, N - K - family_size + overlap), nrow = 2),
+                       alternative = "greater")$estimate, .groups = "drop") %>%
+    mutate(p.fdr = p.adjust(p, method = "BH")) %>%
+    arrange(p.fdr)}
+```
+```{r ORA results}
+# Run ORA
+SFARI_ORA = map_dfr(names(SFARI_gene.list.cat), \(g){
+  gene.ORA(sfari_genes = unique(SFARI_gene.list.cat[[g]]$`ensembl-id`),
+           family2gene = MRI_modality.family2gene,
+           universe = unique(FLAMES_background$ENSGID)) %>%
+    mutate(SFARI_group = g)})
+
+SFARI_ORA_allMRI = map_dfr(names(SFARI_gene.list.cat), \(g){
+  gene.ORA(
+    sfari_genes = unique(SFARI_gene.list.cat[[g]]$`ensembl-id`),
+    family2gene = MRI_modality.family2gene.all,
+    universe = unique(FLAMES_background$ENSGID)) %>%
+    mutate(SFARI_group = g)})
+
+# combine table
+SFARI_ORA.results = full_join(SFARI_ORA, SFARI_ORA_allMRI)
+sig.SFARI_ORA.results = SFARI_ORA.results %>% filter(p.fdr < 0.05)
+```
+```{r write ST8 SFARI_ORA.results}
+write.table(SFARI_ORA.results, 
+            here("result_manuscript/ST8_Autism_vs_MRI_family_ORA.txt"),
+            quote = FALSE, row.names = FALSE)
+```
+
+# Section 7: rg with Autism and Autistic Traits
+```{r section 7 specific packages}
+# brain visualisation
+library(ggseg)
+library(ggsegGlasser) # cortical
+
+# MR
+library(TwoSampleMR)
+
+# network
+library(igraph)
+```
+
+## rg visualisation
+```{r Autistic traits and Autism vs MRI GWAS, eval=FALSE, include=FALSE}
+# AQ
+AQ.path = list.files(glue("{path_UKB.vw}SPQ/SPQ_post_GWAS/ldsc_h2_and_rg"), pattern ="rg_AQ_vs_.*\\.log$", full.names = TRUE)
+AQ_global.path = list.files(here("script_manuscript/genetic_correlation_component/rg_result/"), pattern ="UKB_AQ_.*\\.log$", full.names = TRUE)
+AQ.path_all = c(AQ.path, AQ_global.path)
+
+AQ.rg = ldsc_rg_batch_read(AQ.path_all)  %>% 
+  mutate(p.exp_adj = p.adjust(p, method = "fdr"), 
+         p.exp_label = case_when(p.exp_adj <0.001 ~ "***", p.exp_adj <0.01 ~ "**", p.exp_adj <0.05 ~ "*", TRUE ~ NA_character_)) %>% 
+  rename(GWAS_name = p2_base) %>% mutate(GWAS_name = gsub("GWAS_", "", GWAS_name))
+
+AQ.rg.formatted = sup_table_name_cleaner(AQ.rg) %>%
+  sup_table_formatter() %>%
+  group_by(MRI_scale, MRI_pheno) %>%
+  mutate(
+    p.idp_adj = p.adjust(p, method = "fdr"),
+    p.idp_label = case_when(
+      p.idp_adj < 0.001 ~ "***",
+      p.idp_adj < 0.01  ~ "**",
+      p.idp_adj < 0.05  ~ "*",
+      TRUE ~ NA_character_)) %>%
+  ungroup() %>%
+  mutate(p1_base = "AQ_total_score") %>%
+  relocate(p, p.label, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label, .after = last_col())
+
+# SPQ
+SPQ.path = list.files(glue("{path_UKB.vw}SPQ/SPQ_post_GWAS/ldsc_h2_and_rg"), pattern ="rg_SPQ_vs_.*\\.log$", full.names = TRUE)
+SPQ_global.path = list.files(here("script_manuscript/genetic_correlation_component/rg_result/"), pattern ="total_vs_.*\\.log$", full.names = TRUE)
+SPQ.path_all = c(SPQ.path, SPQ_global.path)
+SPQ.path_all = SPQ.path_all[!grepl("rg_SPQ_vs_autismQ|rg_SPQ_vs_PSYCH", SPQ.path_all)]
+
+SPQ.rg = ldsc_rg_batch_read(SPQ.path_all)  %>% 
+  mutate(p.exp_adj = p.adjust(p, method = "fdr"), 
+         p.exp_label = case_when(p.exp_adj <0.001 ~ "***", p.exp_adj <0.01 ~ "**", p.exp_adj <0.05 ~ "*", TRUE ~ NA_character_)) %>% 
+  rename(GWAS_name = p2_base)
+
+SPQ.rg.formatted = sup_table_name_cleaner(SPQ.rg) %>%
+  sup_table_formatter() %>%
+  group_by(MRI_scale, MRI_pheno) %>%
+  mutate(
+    p.idp_adj = p.adjust(p, method = "fdr"),
+    p.idp_label = case_when(
+      p.idp_adj < 0.001 ~ "***",
+      p.idp_adj < 0.01  ~ "**",
+      p.idp_adj < 0.05  ~ "*",
+      TRUE ~ NA_character_)) %>%
+  ungroup() %>%
+  mutate(p1_base = "SPQ_total_score") %>%
+  relocate(p, p.label, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label, .after = last_col())
+
+# Autism
+ASD.path = list.files(glue("{path_UKB.vw}SPQ/SPQ_post_GWAS/ldsc_h2_and_rg"), pattern ="rg_ASD_vs_.*\\.log$", full.names = TRUE)
+ASD_global.path = list.files(here("script_manuscript/genetic_correlation_component/rg_result/"), pattern ="Autism_Grove_.*\\.log$", full.names = TRUE)
+ASD.path_all = c(ASD.path, ASD_global.path)
+
+ASD.rg = ldsc_rg_batch_read(ASD.path_all)  %>% 
+  mutate(p.exp_adj = p.adjust(p, method = "fdr"), 
+         p.exp_label = case_when(p.exp_adj <0.001 ~ "***", p.exp_adj <0.01 ~ "**", p.exp_adj <0.05 ~ "*", TRUE ~ NA_character_)) %>% 
+  rename(GWAS_name = p2_base)
+
+ASD.rg.formatted = sup_table_name_cleaner(ASD.rg) %>%
+  sup_table_formatter() %>%
+  group_by(MRI_scale, MRI_pheno) %>%
+  mutate(
+    p.idp_adj = p.adjust(p, method = "fdr"),
+    p.idp_label = case_when(
+      p.idp_adj < 0.001 ~ "***",
+      p.idp_adj < 0.01  ~ "**",
+      p.idp_adj < 0.05  ~ "*",
+      TRUE ~ NA_character_)) %>%
+  ungroup() %>%
+  mutate(p1_base = "Autism_Grove") %>%
+  relocate(p, p.label, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label, .after = last_col())
+
+# Autism: Daner
+ASD_Daner.path = list.files(here("script_manuscript/genetic_correlation_component/rg_result/"), pattern ="ASDraw_.*\\.log$", full.names = TRUE)
+
+ASD_Daner.rg = ldsc_rg_batch_read(ASD_Daner.path)  %>% 
+  mutate(p.exp_adj = p.adjust(p, method = "fdr"), 
+         p.exp_label = case_when(p.exp_adj <0.001 ~ "***", p.exp_adj <0.01 ~ "**", p.exp_adj <0.05 ~ "*", TRUE ~ NA_character_)) %>% 
+  rename(GWAS_name = p2_base)
+
+ASD_Daner.rg.formatted = sup_table_name_cleaner(ASD_Daner.rg) %>%
+  sup_table_formatter() %>%
+  group_by(MRI_scale, MRI_pheno) %>%
+  mutate(
+    p.idp_adj = p.adjust(p, method = "fdr"),
+    p.idp_label = case_when(
+      p.idp_adj < 0.001 ~ "***",
+      p.idp_adj < 0.01  ~ "**",
+      p.idp_adj < 0.05  ~ "*",
+      TRUE ~ NA_character_)) %>%
+  ungroup() %>%
+  mutate(p1_base = "Autism_Daner") %>%
+  relocate(p, p.label, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label, .after = last_col())
+
+# Autism Stratified by Age: Early
+ASD.AaD_early.path = list.files(here("script_manuscript/genetic_correlation_component/rg_result/"), pattern ="up_early_.*\\.log", full.names = TRUE)
+ASD.AaD_early.rg = ldsc_rg_batch_read(ASD.AaD_early.path)  %>% 
+  mutate(p.exp_adj = p.adjust(p, method = "fdr"), 
+         p.exp_label = case_when(p.exp_adj <0.001 ~ "***", p.exp_adj <0.01 ~ "**", p.exp_adj <0.05 ~ "*", TRUE ~ NA_character_)) %>% 
+  rename(GWAS_name = p2_base)
+
+ASD.AaD_early.rg.formatted = sup_table_name_cleaner(ASD.AaD_early.rg) %>%
+  sup_table_formatter() %>%
+  group_by(MRI_scale, MRI_pheno) %>% # macro-idp = 181; micro-idp = 208; subcor_vol = 26
+  mutate(
+    p.idp_adj = p.adjust(p, method = "fdr"),
+    p.idp_label = case_when(
+      p.idp_adj < 0.001 ~ "***",
+      p.idp_adj < 0.01  ~ "**",
+      p.idp_adj < 0.05  ~ "*",
+      TRUE ~ NA_character_)) %>%
+  ungroup() %>%
+  mutate(p1_base = "Autism_Early_Diagnosed") %>%
+  relocate(p, p.label, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label, .after = last_col())
+
+# Autism Stratified by Age: Late
+ASD.AaD_late.path = list.files(here("script_manuscript/genetic_correlation_component/rg_result/"), pattern ="up_late_.*\\.log", full.names = TRUE)
+ASD.AaD_late.rg = ldsc_rg_batch_read(ASD.AaD_late.path)  %>% 
+  mutate(p.exp_adj = p.adjust(p, method = "fdr"), 
+         p.exp_label = case_when(p.exp_adj <0.001 ~ "***", p.exp_adj <0.01 ~ "**", p.exp_adj <0.05 ~ "*", TRUE ~ NA_character_)) %>% 
+  rename(GWAS_name = p2_base)
+
+ASD.AaD_late.rg.formatted = sup_table_name_cleaner(ASD.AaD_late.rg) %>%
+  sup_table_formatter() %>%
+  group_by(MRI_scale, MRI_pheno) %>% # macro-idp = 181; micro-idp = 208; subcor_vol = 26
+  mutate(
+    p.idp_adj = p.adjust(p, method = "fdr"),
+    p.idp_label = case_when(
+      p.idp_adj < 0.001 ~ "***",
+      p.idp_adj < 0.01  ~ "**",
+      p.idp_adj < 0.05  ~ "*",
+      TRUE ~ NA_character_)) %>%
+  ungroup() %>%
+  mutate(p1_base = "Autism_Late_Diagnosed") %>%
+  relocate(p, p.label, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label, .after = last_col())
+
+master_rg.df = reduce(list(AQ.rg.formatted, SPQ.rg.formatted, 
+                           ASD.rg.formatted, ASD_Daner.rg.formatted, 
+                           ASD.AaD_early.rg.formatted, ASD.AaD_late.rg.formatted), full_join)
+
+# save results
+write.table(master_rg.df, here("script_manuscript/genetic_correlation_component/master_rg_results.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+```{r rg visualisation: Data prep}
+# read in and filter data
+master_rg.df = fread(here("script_manuscript/genetic_correlation_component/master_rg_results.txt"))
+
+# non-global region visualisation
+sig.master_rg.df = master_rg.df %>% 
+  filter(MRI_scale == "regional") %>% 
+  select(p1_base, MRI_scale, MRI_pheno, region, rg, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label) %>%
+    mutate(p_label = case_when(!is.na(p.exp_label) ~ "exp_sig", !is.na(p.idp_label) ~ "idp_sig"),
+           p1_base = factor(p1_base, levels = c("AQ_total_score", "SPQ_total_score", 
+                                                "Autism_Grove", "Autism_Daner", 
+                                                "Autism_Early_Diagnosed", "Autism_Late_Diagnosed")))
+```
+```{r SF4.1 rg visusalisation: Cortical Brain Regions across all conditions}
+rg_reg_brain_vis = sig.master_rg.df %>%
+  ggplot(mapping=aes(fill = rg, color = p_label)) + 
+  geom_brain(atlas = glasser(), hemi = "left", view = c("lateral", "medial"), size = 0.2) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "coral",
+                       midpoint = 0, limits = c(-1, 1), na.value = "grey90", name = "rg") +
+  scale_colour_manual(values = c(idp_sig = "black", exp_sig = "red"),na.value = "grey80", name = NULL) +
+  facet_grid(MRI_pheno ~ p1_base) +
+  theme_void() + 
+  guides(colour = "none",
+         fill = guide_colourbar(barheight = unit(3, "cm"), barwidth  = unit(0.4, "cm"))) +
+  theme(strip.text = element_text(size = 5))
+
+ggsave(here("result_manuscript/SF4.1_rg_brain_plot.svg"), rg_reg_brain_vis, width = 11, height = 8) # To move NA layer level last
+ggsave(here("result_manuscript/SF4.1_rg_brain_plot.png"), rg_reg_brain_vis, width = 11, height = 8)
+ggsave(here("result_manuscript/SF4.1_rg_brain_plot.pdf"), rg_reg_brain_vis, width = 11, height = 8)
+```
+```{r F4.3.x significant results}
+# Bar plot panel A
+sig_global_p1 = master_rg.df %>%
+  filter(MRI_scale == "global", p < 0.05) %>%
+  pull(p1_base) %>%
+  unique()
+
+sig_global_p1.df = master_rg.df %>% 
+  filter(p1_base %in% sig_global_p1 & MRI_scale == "global") %>% 
+  mutate(MRI_pheno = factor(MRI_pheno, levels = MRI_pheno.list),
+         MRI_label = case_when(MRI_pheno %in% DTI_pheno.list ~ "dMRI",
+                               MRI_pheno %in% STR_pheno.list ~ "sMRI"),
+         p1_name = gsub("_", " ", p1_base))
+
+rg_global_bar_vis = sig_global_p1.df %>%
+  ggplot(aes(x = MRI_pheno, y = rg, color = MRI_label)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_point() +
+  geom_errorbar(aes(ymin = rg - CI, ymax = rg + CI), width = 0.2) +
+  geom_text(aes(label = p.label), vjust = -0.03, size = 4) +
+  scale_color_manual(values = c("sMRI" = "coral", "dMRI" = "#2166AC")) +
+  coord_flip() +
+  ylim(-0.5, 0.5) +
+  facet_wrap(~p1_name, scales = "free_y") +
+  labs(x = NULL, y = expression(r[g])) +
+  theme_classic() +
+  guides(color = "none") + 
+  theme(strip.text = element_text(size = 10, face = "bold"))
+
+ggsave(here("result_manuscript/F4.3.x_rg_global_plot.png"), rg_global_bar_vis, width = 6, height = 5)
+ggsave(here("result_manuscript/F4.3.x_rg_global_plot.pdf"), rg_global_bar_vis, width = 6, height = 5)
+
+# Significant only Panel B
+sig_regional_p1 = sig.master_rg.df %>%
+  filter(MRI_scale == "regional", p.idp_adj < 0.05) %>%
+  distinct(p1_base, MRI_pheno)
+
+sig_regional_p1.df = sig.master_rg.df %>%
+  semi_join(sig_regional_p1, by = c("p1_base", "MRI_pheno")) %>%
+  filter(MRI_scale == "regional") %>%
+  mutate(p1_name = gsub("_", " ", p1_base))
+
+rg_sig.reg_brain_vis = sig_regional_p1.df %>%
+  ggplot(mapping=aes(fill = rg, color = p_label)) + 
+  geom_brain(atlas = glasser(), hemi = "left", view = c("lateral", "medial"), size = 0.3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "coral",
+                       midpoint = 0, limits = c(-0.5, 0.5), na.value = "grey90", name = "rg") +
+  scale_colour_manual(values = c(idp_sig = "black", exp_sig = "red"),na.value = "grey80", name = NULL) +
+  facet_wrap(~ p1_name + MRI_pheno, ncol = length(unique(sig_regional_p1.df$p1_base)), dir = "v") +
+  theme_void() + 
+  guides(colour = "none", fill = guide_colourbar(barheight = unit(3, "cm"), barwidth  = unit(0.4, "cm"))) +
+  theme(strip.text = element_text(size = 8))
+
+ggsave(here("result_manuscript/F4.3.x_rg_sig.regional_plot.svg"), rg_sig.reg_brain_vis, width = 14, height = 8) # To move NA layer level last
+ggsave(here("result_manuscript/F4.3.x_rg_sig.regional_plot.png"), rg_sig.reg_brain_vis, width = 14, height = 8)
+ggsave(here("result_manuscript/F4.3.x_rg_sig.regional_plot.pdf"), rg_sig.reg_brain_vis, width = 14, height = 8)
+```
+## Statistical Model for Prediction
+```{r hubness modelling and graph}
+# load network and calculate rg magnitude
+rg_network = readRDS(here("script_manuscript/network_clustering_component/rg_network.Rds"))
+E(rg_network)$abs_rg = abs(E(rg_network)$rg)
+
+# investigate network properties: Strength, eigenvector centrality, betweenness centrality
+net_prop.df = tibble(GWAS_name = V(rg_network)$name, 
+                     strength = strength(rg_network, weights = E(rg_network)$abs_rg),
+                     eigencent = eigen_centrality(rg_network, weights = E(rg_network)$abs_rg)$vector,
+                     betweenness = betweenness(rg_network, weights = 1 / E(rg_network)$abs_rg, normalized = TRUE))
+
+asd_rg.df = master_rg.df %>% 
+  filter(p1_base %in% c("Autism_Early_Diagnosed", "Autism_Late_Diagnosed")) %>% # select latent Autism GWAS
+  mutate(GWAS_name = paste(MRI_scale, MRI_pheno, region, sep = "_"),
+         GWAS_name = gsub("_NA", "", GWAS_name))
+
+asd_net.df = as.data.table(left_join(asd_rg.df, net_prop.df, by = "GWAS_name")) %>% 
+  select(p1_base, GWAS_name, MRI_scale, MRI_pheno, region, rg, p, strength, eigencent, betweenness)
+
+ggplot(asd_net.df, aes(strength, p)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~p1_base)
+
+ggplot(asd_net.df, aes(eigencent, p)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~p1_base)
+
+ggplot(asd_net.df, aes(-log(betweenness), p)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~p1_base)
+```

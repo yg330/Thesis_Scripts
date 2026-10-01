@@ -1,0 +1,140 @@
+# library
+```{r setup}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+
+# For code reproducibility: and git
+library(here) # project-based relative path finding 
+library(usethis) # git set-up
+
+# For data manipulation
+library(tidyverse)
+library(data.table, include.only = "fread")
+
+# For specific parts of the code
+library(Hmisc, include.only = "hist.data.frame") # For quick visualisation of distribution
+```
+
+# Imaging Data preprocessing
+```{r Format ABCD imaging data}
+# Amir's comment on how the data was generated:
+# The values are bilaterally averaged, and outliers have been removed using MAD and SD. 
+# I extracted the ASEG values using the `asegstats2table` function in FreeSurfer, as I couldn’t locate them in Richard’s specified directory.
+
+# Amir's comment on safe regions of interest:
+# Intracranial volume, lateral ventricles, nucleus accumbens, caudate, putamen, pallidum, amygdala, hippocampus, thalamus and brainstem. The cerebellum is not subcortical, but it is included in the ASEG stats as ROI.
+
+ABCD_ASEG_data = fread(here("imaging_data/All_ABCD_ASEG_ready.csv")) %>% mutate(FID = IID) %>% relocate(FID, IID)
+write.table(ABCD_ASEG_data, file = here("result_supplement/ABCD_GWAS/ABCD_subcor.formatted.sd.mad.QCed.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+# COVAR Data preprocessing
+```{r Generate formatted files for GWAS, eval=FALSE, include=FALSE}
+# Read in Tables with extra info
+ABCD.PCA = fread(here("imaging_data/ABCD_PCsforGWAS_European.txt"))
+new_colnames = c("FID", paste0("PCA", 1:32))
+colnames(ABCD.PCA) = new_colnames
+ABCD.PCA$IID = ABCD.PCA$FID
+ABCD.PCA = ABCD.PCA %>% select(c(FID, IID, paste0("PCA", 1:20))) # only includes first 20 PCAs
+
+
+ABCD.COVAR = fread("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/ABCD/Imaging_phenotypes/ABCD_allcovariates.txt")
+
+# merge table
+ABCD.COVAR.ALL = left_join(ABCD.PCA, ABCD.COVAR, by = c("FID", "IID")) %>% relocate(FID, IID) 
+# Only half of the ABCD population is European with PCA, thus merge by FID and IID that are existed in the ABCD PCA.
+
+# Investigate NA population (These will be automatically ignored by GCTA-fastGWA, thus will be excluded from reported population)
+sum(is.na(ABCD.COVAR.ALL$fd_1)) # 559 people
+sum(is.na(ABCD.COVAR.ALL$fd_max_1)) # 559 people
+sum(is.na(ABCD.COVAR.ALL$leftplusright)) # 559 people
+```
+```{r Create Disecrete COVAR}
+# Create Discrete COVAR Table
+  # Sex as gender
+  # MRI Scanning Site as site_id_l
+
+# Code MRI Site to numbers
+ABCD.COVAR.ALL$site_id_l = as.numeric(gsub("site", "", ABCD.COVAR.ALL$site_id_l))
+
+# Create discrete COVAR
+ABCD.discrete.COVAR = ABCD.COVAR.ALL %>% select("FID", "IID", "gender", "site_id_l")
+write.table(ABCD.discrete.COVAR, file = here("result_supplement/ABCD_GWAS/ABCD_discrete.COVAR.formatted.txt"), row.names = F, quote = F)
+
+```
+```{r Create Continous COVAR}
+# Create Continuous COVAR Table
+  # "interview_age" - scaled()
+  # "Agesquared" - scaled(interview_age)^2 
+  # "Age_Sex" and "Age_Sex^2" - scaled(sex[0/1]) * "Age and scaled(sex[0/1]) * agesquared
+  # "genetic PCA": First 20 gPCAs
+  # "Euler" = leftplusright
+  # "fd_1" and "fd_max_1": framepair displacement
+
+# Grab all relevant COVARs
+PCA_list = c(paste0("PCA", 1:20))
+ABCD.continous.COVAR = ABCD.COVAR.ALL %>% select("FID", "IID", "interview_age", all_of(PCA_list), "leftplusright", "fd_1", "fd_max_1", "gender")
+ABCD.continous.COVAR = ABCD.continous.COVAR %>% rename("euler" = "leftplusright") # rename leftplusright to Euler Index
+
+# standardisation
+ABCD.continous.COVAR[,c(3:27)] <- lapply(ABCD.continous.COVAR[,c(3:27)], scale)
+ABCD.continous.COVAR$age_squared = ABCD.continous.COVAR$interview_age**2 # to generate age_squared
+
+# generate age_sex and age_sex^2
+ABCD.continous.COVAR$age_sex = ABCD.continous.COVAR$interview_age * ABCD.continous.COVAR$gender
+ABCD.continous.COVAR$age_sqred_sex = ABCD.continous.COVAR$age_squared * ABCD.continous.COVAR$gender
+ABCD.continous.COVAR = ABCD.continous.COVAR %>% select(-gender) # remove gSEX as it's continous covar only.
+write.table(ABCD.continous.COVAR, file =here("result_supplement/ABCD_GWAS/ABCD_continous.COVAR.formatted.txt"), row.names = F, quote = F)
+```
+
+# FID and IID formatting: For GCTA fastGWA
+```{r test why GWA didn't run}
+# Error log said after checking all COVARs, no participants were left, check if it's true:
+
+# Get all dataset merged together
+ABCD.continous.COVAR = fread(here("result_supplement/ABCD_GWAS/ABCD_continous.COVAR.formatted.txt"))
+ABCD.discrete.COVAR = fread(here("result_supplement/ABCD_GWAS/ABCD_discrete.COVAR.formatted.txt"))
+ABCD.subcor = fread(here("result_supplement/ABCD_GWAS/ABCD_subcor.formatted.sd.mad.QCed.txt"))
+
+ABCD <- list(ABCD.continous.COVAR, ABCD.discrete.COVAR, ABCD.subcor)
+ABCD_ALL <- reduce(ABCD, full_join, by = c("FID", "IID"))
+
+# check if the statment by error log is true:
+cols_to_check <- c(colnames(ABCD.continous.COVAR), colnames(ABCD.discrete.COVAR))
+cols_to_check = cols_to_check[!cols_to_check %in% c("FID", "IID")]
+
+complete_ABCD <- ABCD_ALL %>%
+ filter(across(all_of(cols_to_check), ~!is.na(.))) # 5119 people with no missing COVARs at all and should've been included in the fastGWA
+
+# Check FAM and complete ABCD overlap
+
+# .fam files have the following column structure:
+# Family ID (FID)
+# Individual ID (IID)
+# Father's ID (0 if unknown)
+# Mother's ID (0 if unknown)
+# Sex code (1=male, 2=female, 0=unknown)
+# Phenotype value (-9/0=missing, 1=unaffected, 2=affected, quantitative value=quantitative trait)
+
+# FID and IID are different from what presented in the ABCD.subcor. Therefore, maybe why it did not run properly.
+
+ABCD_fam = fread("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/ABCD/ABCD_hg19_allchrs_europeanonly.fam", select = c(1,2)) # grab first two columns, which are FID and IID
+colnames(ABCD_fam) = c("FID", "IID")
+
+# Rewrite to conform to be consistent:
+ABCD.continous.COVAR = ABCD.continous.COVAR %>% select(!"FID")
+ABCD.continous.COVAR.formatted = left_join(ABCD.continous.COVAR, ABCD_fam, by = "IID") %>% relocate(FID, IID)
+write.table(ABCD.continous.COVAR.formatted, file = here("result_supplement/ABCD_GWAS/ABCD_continous.COVAR.formatted.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+ABCD.discrete.COVAR = ABCD.discrete.COVAR %>% select(!"FID")
+ABCD.discrete.COVAR.formatted = left_join(ABCD.discrete.COVAR, ABCD_fam, by = "IID") %>% relocate(FID, IID)
+write.table(ABCD.discrete.COVAR.formatted, file = here("result_supplement/ABCD_GWAS/ABCD_discrete.COVAR.formatted.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+ABCD.subcor = ABCD.subcor %>% select(!"FID")
+ABCD.subcor.formatted = left_join(ABCD.subcor, ABCD_fam, by = "IID") %>% relocate(FID, IID)
+write.table(ABCD.subcor.formatted, file = here("result_supplement/ABCD_GWAS/ABCD_subcor.formatted.sd.mad.QCed.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+```

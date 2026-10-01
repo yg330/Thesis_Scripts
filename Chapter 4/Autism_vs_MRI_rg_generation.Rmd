@@ -1,0 +1,163 @@
+```{r run rg_current_MRI_GWAS_vs_past_MRI_GWAS}
+source("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/.Rprofile")
+
+master_path_file = fread(here("script_manuscript/master_GWAS_file_path.txt")) # A Tab seperated path collection of all GWAS-related files, DO NOT UPLOAD TO GIT
+
+sup_table_formatter = function(df){
+  # Splits GWAS_name (e.g. "regional_CT_bankssts.lh_GWAS") into MRI_scale, MRI_pheno, and region columns while removing all other non-important info.
+  df <- df %>% separate_wider_delim(GWAS_name, "_", 
+                                    names = c("MRI_scale", "MRI_pheno", "region", NA, NA), 
+                                    too_few = "align_start", too_many = "merge")
+  
+  # Sets region to NA for global phenotypes as they have no regional parcellation.
+  df$region <- ifelse(df$MRI_scale == "global", NA, df$region)
+  
+  return(df)
+}
+
+# set p1
+p1_GWAS_path = sup_table_formatter(master_path_file) %>% filter(MRI_scale %in% c("global", "SubCor","tract")) %>% select(1:3, "UKB_sumstats_path")
+p1_GWAS_path <- p1_GWAS_path %>%
+  filter(
+    case_when(
+      MRI_scale == "global"  ~ TRUE,
+      MRI_scale == "SubCor"  ~ region %in% c("Amygdala", "Thalamus.Proper", "Pallidum", 
+                                             "Accumbens.area", "Putamen", "Hippocampus", "Caudate"),
+      MRI_scale == "tract"   ~ MRI_pheno %in% c("FA", "MD") & 
+        region %in% c("cst.l", "cst.r", "unc.l", "unc.r"),
+      TRUE ~ FALSE
+    )
+  ) %>%
+  mutate(region = recode(region,
+                         "Thalamus.Proper" = "Thalamus",
+                         "Accumbens.area"  = "Accumbens"
+  )) %>% rename(p1_path = UKB_sumstats_path)
+
+# set p2
+# munged sumstat for global phenotypes (vw2023)
+p2_2023 = data.frame(MRI_pheno = list.files(here("post_GWAS_analysis/MRI_GWAS_sumstat_2023"), pattern = ".sumstats"),
+                                    p2_path = list.files(here("post_GWAS_analysis/MRI_GWAS_sumstat_2023"), pattern = ".sumstats", full.names = TRUE))
+p2_2023$MRI_pheno = gsub(".sumstats", "", p2_2023$MRI_pheno)
+p2_2023 = p2_2023 %>% mutate(MRI_pheno = recode(MRI_pheno,
+                                             "Folding_Index" = "FI",
+                                             "Gaussian_curvature"  = "GC",
+                                             "Intrinsic_curvature" = "IC",
+                                             "Mean_curvature" = "MC",
+                                             "Volume" = "GMV"),
+                             MRI_scale = "global",
+                             region = NA)
+
+# Subcortical volume: Hibar, D. P., Stein, J. L., Renteria, M. E., Arias-Vasquez, A., Desrivieres, S., Jahanshad, N., … Thompson, P. M., Medland, S. E. (2015). Common genetics variants influence human subcortical brain structures. Nature, 520(7546), 224–229. http://doi.org/10.1038/nature14101
+
+p2_subcor = data.frame(region = list.files(glue("{path_vw}data/munged_GWAS_sumstats/ldsc_MRI_SubcorticalVolume_Hibar_ENIGMA2_2015"), 
+                                                             pattern = ".sumstats"),
+                                      p2_path = list.files(glue("{path_vw}data/munged_GWAS_sumstats/ldsc_MRI_SubcorticalVolume_Hibar_ENIGMA2_2015"), 
+                                                                      pattern = ".sumstats", full.names = TRUE))
+p2_subcor$region = gsub("ENIGMA2_Mean|_Combined_GenomeControlled_Jan23|.sumstats", "", p2_subcor$region)
+p2_subcor = p2_subcor %>% mutate(MRI_scale = "SubCor", MRI_pheno = "Vol")
+
+# tract: Zhao et al. (2019) Large-scale GWAS reveals genetic architecture of brain white matter microstructure and genetic overlap with cognitive and mental health` traits (n=17,706). Molecular Psychiatry. ENIGMA https://www.med.unc.edu/bigs2/data/gwas-summary-statistics/
+p2_tract = data.frame(GWAS_name = list.files(glue("{path_vw}data/munged_GWAS_sumstats/ldsc_MRI_tract_Zhao_ENIGMA_2019"), pattern = ".sumstats"),
+                      p2_path = list.files(glue("{path_vw}data/munged_GWAS_sumstats/ldsc_MRI_tract_Zhao_ENIGMA_2019"), 
+                                                                     pattern = ".sumstats", full.names = TRUE))
+p2_tract$GWAS_name = gsub("ukb_dti441_dec12_2018_phase1and2_|_allchr_withA2|.sumstats", "", p2_tract$GWAS_name)
+p2_tract = p2_tract %>% mutate(MRI_pheno = recode(GWAS_name,
+                                                "pheno19" = "FA",
+                                                "pheno61"  = "FA",
+                                                "pheno271" = "MD",
+                                                "pheno313" = "MD"),
+                               region = recode(GWAS_name,
+                                               "pheno19" = "cst",
+                                               "pheno61"  = "unc",
+                                               "pheno271" = "cst",
+                                               "pheno313" = "unc")) %>% select(!GWAS_name)
+p2_tract = rbind(p2_tract, p2_tract) %>%
+  mutate(region = case_when(
+    row_number() <= 4 ~ paste0(region, ".l"),
+    TRUE              ~ paste0(region, ".r")
+  )) %>% mutate(MRI_scale = "tract")
+
+rg_GWAS_path = reduce(list(p2_2023, p2_subcor, p2_tract, p1_GWAS_path), full_join)[1:26,] # drop Putamen due to beta value doesn't fit ldsc expectation, this is due to low power from original GWAS
+
+run_ldsc_rg <- function(rg_GWAS_path, output_dir) {
+  ldsc_path="/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/ldsc/ldsc.py"
+  ld_chr_dir="/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/ldsc/eur_w_ld_chr/"
+  
+  rg_GWAS_path %>%
+    rowwise() %>%
+    mutate(command = paste(
+      "python2", ldsc_path,
+      "--rg", paste(p1_path, p2_path, sep = ","),
+      "--ref-ld-chr", ld_chr_dir,
+      "--w-ld-chr", ld_chr_dir,
+      "--out", file.path(output_dir, paste0(MRI_pheno, "_", MRI_scale, 
+                                            ifelse(is.na(region), "", paste0("_", region))))
+    )) %>%
+    pull(command) %>%
+    walk(system)
+}
+
+run_ldsc_rg(rg_GWAS_path, "/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/script_manuscript/rg_UKB_vs_past_MRI")
+```
+```{r make run_ldsc_command function}
+run_ldsc_command = function(p1_sumstats.path, p2_sumstats.path, output_name.path) {
+  
+  # Set ldsc script path and ld_chr_dir path
+  ldsc_path   = glue("{path_vw}ldsc/ldsc.py")
+  ld_chr_dir  = glue("{path_vw}ldsc/eur_w_ld_chr/")
+  
+  # Compress sumstats and current_condition into one comma-separated string
+  rg.trait.list = paste(c(p1_sumstats.path, p2_sumstats.path), collapse = ",")
+
+  # Build and run the ldsc command
+  cmd = glue(
+    "python2 {ldsc_path}",
+    " --rg {rg.trait.list}",
+    " --ref-ld-chr {ld_chr_dir}",
+    " --w-ld-chr {ld_chr_dir}",
+    " --out {output_name.path}")
+  
+  return(cmd)
+  }
+```
+```{r between Autism, ADHD, PSYCH_Traits}
+SPQ_total_sumstat = here("SPQ_post_GWAS/ldsc_munged/total.sumstats.gz")
+
+# For AQ
+AQ_sumstat = list.files(glue("{path_UKB.vw}AQ/ldsc_munged.sumstats"), pattern = ".sumstats.gz", full.names = TRUE)
+SPQ_vs_AQ_cmd = run_ldsc_command(SPQ_total_sumstat, AQ_sumstat, here("SPQ_post_GWAS/ldsc_h2_and_rg/SPQ_vs_AQ"))
+submit_slurm(account = account,
+             job_name = "rg_SPQ_vs_autismQ", 
+             conda_env = "ldsc", 
+             command = SPQ_vs_AQ_cmd,
+             home_dir = here("SPQ_post_GWAS/ldsc_h2_and_rg"), 
+             log_dir = here("SPQ_post_GWAS/ldsc_h2_and_rg"))
+
+# For PSYCH
+PSYCH_sumstat = list.files(glue("{path_vw}ldsc/sumstats/"), pattern = ".sumstats.gz", recursive = TRUE, full.names = TRUE)
+SPQ_vs_PSYCH_cmd = run_ldsc_command(SPQ_total_sumstat, PSYCH_sumstat, here("SPQ_post_GWAS/ldsc_h2_and_rg/SPQ_vs_PSYCH"))
+submit_slurm(account = account,
+             job_name = "rg_SPQ_vs_PSYCH", 
+             conda_env = "ldsc", 
+             time = "6:00:00",
+             command = SPQ_vs_PSYCH_cmd,
+             home_dir = here("SPQ_post_GWAS/ldsc_h2_and_rg"), 
+             log_dir = here("SPQ_post_GWAS/ldsc_h2_and_rg"))
+
+# For MRI phenotypes
+MRI_sumstat = fread(glue("{path_UKB.vw}Imaging_genetics/yg330/script_manuscript/master_GWAS_file_path.txt"), select = c("GWAS_name", "UKB_sumstats_path"))
+MRI_sumstat = sup_table_formatter(MRI_sumstat) 
+MRI_sumstat = na.omit(MRI_sumstat, cols = "UKB_sumstats_path") # remove FI_AVI since no GWAS hence sumstats exist for it.
+
+for (pheno in unique(MRI_sumstat$MRI_pheno)){
+  current_MRI_sumstat = subset(MRI_sumstat, MRI_sumstat$MRI_pheno == pheno)
+  current_SPQ_vs_MRI_cmd = run_ldsc_command(SPQ_total_sumstat, current_MRI_sumstat$UKB_sumstats_path, here(glue("SPQ_post_GWAS/ldsc_h2_and_rg/SPQ_vs_{pheno}")))
+  submit_slurm(account = account,
+             job_name = glue("rg_SPQ_vs_{pheno}"),
+             conda_env = "ldsc",
+             time = "3:00:00",
+             command = current_SPQ_vs_MRI_cmd,
+             home_dir = here("SPQ_post_GWAS/ldsc_h2_and_rg"),
+             log_dir = here("SPQ_post_GWAS/ldsc_h2_and_rg"))
+}
+```

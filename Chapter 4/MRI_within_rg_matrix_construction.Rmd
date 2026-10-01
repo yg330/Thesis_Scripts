@@ -1,0 +1,291 @@
+# library set up
+```{r setup}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+
+# For code reproducibility: and git
+library(here) # project-based relative path finding 
+library(usethis) # git set-up
+
+# For data manipulation
+library(tidyverse)
+library(data.table)
+```
+
+## rg matrix
+```{r find all unique rg pairs for processing}
+# Find all phenotype in sumstats form
+pheno_list = list.files(here("result_supplement/GWAS_sumstat"), pattern = ".sumstats.gz", recursive = TRUE)
+
+# Find all unique combinations to optimise resource usage
+unique_pairs = t(combn(pheno_list, 2))
+
+
+# Function to combine strings with a consideration of dynamically changing maximum elements per string
+combine_strings <- function(input_table, max_elements = 181) {
+  # Initialize an empty list to store the combined strings
+  combined_strings <- list()
+  # Initialize an empty vector to store the current combination
+  current_combination <- c()
+  # Initialize a variable to store the current key (value from the first column)
+  current_key <- NULL
+  
+  # Loop through each row of the input table
+  for (i in 1:nrow(input_table)) {
+    # If current_key is NULL or the value in the first column has changed
+    if (is.null(current_key) || input_table[i, 1] != current_key) {
+      
+      # If the current combination is not empty, add it to the combined_strings list
+      if (length(current_combination) > 0) {
+        combined_strings <- c(combined_strings, list(current_combination))
+      }
+      
+      # Update the current_key to the new value from the first column
+      current_key <- input_table[i, 1]
+      
+      # Start a new combination with the current_key as the first element
+      current_combination <- c(current_key)
+    }
+    
+    # Add the value from the second column to the current combination
+    current_combination <- c(current_combination, input_table[i, 2])
+    
+    # If the current combination has reached the maximum number of elements
+    if (length(current_combination) - 1 == max_elements) {
+      # Add the current combination to the combined_strings list
+      combined_strings <- c(combined_strings, list(current_combination))
+      
+      # Start a new combination with the current_key as the first element
+      current_combination <- c(current_key)
+    }
+  }
+  
+  # If there is any remaining combination, add it to the combined_strings list
+  if (length(current_combination) > 1) {
+    combined_strings <- c(combined_strings, list(current_combination))
+  }
+  
+  # Return the list of combined strings
+  return(combined_strings)
+}
+
+
+
+# Flatten the list so it's in ldsc-ready format
+flatten_pairs <- function(input_list) {
+  flattened_strings <- sapply(input_list, function(combination) {
+    paste(combination, collapse = ",")
+  })
+  return(flattened_strings)
+}
+
+
+
+# Format results
+result <- combine_strings(unique_pairs, max_elements = 200)
+result_formatted <- flatten_pairs(result)
+
+
+# Write table into chunks for easy referring in bash code
+
+# Break into chunks for array processing
+# For 1 array, tested rg runtime for 1 vs 180 phenotypes is 10 min.
+# Thus, estimated run time for 1 vs 200 pairs is 11.11 min -> Round to 12 mins.
+# Thus, 1 element in result_formatted cost 12 min, 5 elements in result_formatted cost 60 min, thus a hour.
+# Thus, 1 array per hour calculate 5 elements. 
+# Thus, 1 array per 12 hours calculates 60 elements.
+# Thus, 30 arrays per 12 hours calculate 30 * 60 = 1800 elements.
+# Thus, for 1 batch of 30 arrays that runs for 12 hours, it will take 1800 elements from the result_formatted.
+
+# Divide result_formatted into chunks based on 
+
+elements_per_chunk = 1800
+num_chunks = ceiling(length(result_formatted) / elements_per_chunk) # 9 chunks
+
+chunk_list <- vector("list", num_chunks)
+
+for (i in 1:num_chunks) {
+  start_index <- (i - 1) * elements_per_chunk + 1
+  end_index <- min(i * elements_per_chunk, length(result_formatted)) # 14783/1800 does not divide cleanly so chose the smallest one
+  chunk_list[[i]] <- result_formatted[start_index:end_index]
+  }
+
+# write chunk list
+for (i in 1:num_chunks){
+  location = here("SSHscript/GWAS_rg_matrix/")
+  chunk_file_name = paste0(location, "rg_matrix_chunk_", i, ".txt")
+  writeLines(as.character(chunk_list[[i]]), con = chunk_file_name)
+}
+
+```
+```{r modified ldsc_rg_batch_read function so it save formatted rg log table}
+# Batch read ldsc tables
+ldsc_rg_batch_read_save_as_file = function(file_path, file_name){
+    for (i in seq_along(file_path)){
+      # read file
+      current_path = file_path[i]
+      
+      # read as vector of lines
+      current_file = readLines(current_path)
+      
+      # Find the position of "Summary of Genetic Correlation Results" for current_file
+      result_position = grep("Summary of Genetic Correlation Results", current_file)
+      
+      # read ldsc table
+      df = fread(file_path[i], skip = result_position)
+      
+      # format for easy visualisation
+      df$p1_base = basename(df$p1) # remove path so leaves only basename
+      df$p1_base = gsub(".sumstats|.gz", "", df$p1_base) # remove suffix
+      
+      df$p2_base = basename(df$p2)
+      df$p2_base = gsub(".sumstats|.gz", "", df$p2_base)
+
+      # Find p label
+      df$p.label <- cut(df$p, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", NA))
+      
+      # Find Confidence Interval (CI) at 95%
+      df$CI <- df$se*1.96
+      
+      # log where this table is generated from
+      df$file <- file_name[i]
+      
+      # set name and assign table with specified name
+      df_name = paste0("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/post_GWAS_analysis/rg_matrix/", 
+                       file_name[i], ".formatted_table.txt")
+      
+      # assign table with specified name
+      write.table(df, df_name)
+  }
+}
+
+```
+```{r find numbers that are missing or needed to rerun}
+# hpc environment was restarted during the code so had to figure out what didn't run, check rg_matrix_check_if_complete.sh for more info.
+result = fread(here("SSHscript/GWAS_rg_matrix/rg_log_check_results.txt"))
+
+# pairs needed further investigation
+result_NULL = subset(result, result$REASON=="NULL_RUN")
+result_NULL$FILE = basename(result_NULL$FILE)
+
+# it's due to code problem, but does not effect correlation pair, thus can ignore, just skip these numbers as they do not contribute to the rg matrix table.
+
+# pairs only needed to rerun
+result_rerun = subset(result, result$REASON!="NULL_RUN")
+result_rerun$FILE = basename(result_rerun$FILE)
+result_rerun$FILE = gsub("rg_pair_n_|.log", "", result_rerun$FILE)
+write.table(result_rerun$FILE, here("SSHscript/GWAS_rg_matrix/rg_rerun_pair_n.txt"), col.names = FALSE, row.names = FALSE, quote = FALSE)
+```
+```{r read in and format as correlation matrix and initial visualisation}
+# read in exclusion table: files with NULL RUNs - these are either artifact of the code due to how it is written so no worries on excluding them
+exclusion = fread(here("SSHscript/GWAS_rg_matrix/rg_log_check_results_2nd_time.txt"))
+exclusion$NAME = basename(exclusion$FILE)
+
+# read table
+rg_matrix.loc = list.files("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/post_GWAS_analysis/rg_matrix",
+                           pattern = ".log", full.names = TRUE)
+rg_matrix.loc.QCed = subset(rg_matrix.loc, !(rg_matrix.loc %in% exclusion$FILE))
+rg_matrix.name = basename(rg_matrix.loc.QCed)
+rg_matrix.name = gsub(".log", "", rg_matrix.name)
+
+ldsc_rg_batch_read_save_as_file(rg_matrix.loc.QCed, rg_matrix.name)
+
+# merging table and save in bash
+rg_list_to_merge = list.files("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330//post_GWAS_analysis/rg_matrix", pattern = "formatted_table.txt", full.names = TRUE)
+merged_rg_data <- rbindlist(pblapply(rg_list_to_merge, fread))
+write.table(merged_rg_data, "/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix/merged_rg_pairs.txt")
+
+# compared to unique list generated, found 2717946 vs 2717942, missing 4 rows, try to find out why and how it went missing
+unique_pairs = data.frame(unique_pairs)
+unique_pairs$X1 = gsub(".sumstats.gz", "",unique_pairs$X1)
+unique_pairs$X2 = gsub(".sumstats.gz", "",unique_pairs$X2)
+
+merged_rg_find_missing = select(merged_rg_data, c(p1_base, p2_base)) %>% rename(X1=p1_base,X2=p2_base)
+
+# find and format missing pairs and save to rerun
+missing_rows <- anti_join(unique_pairs, merged_rg_find_missing, by = c("X1", "X2"))
+missing_rows$X1 = paste0(missing_rows$X1, ".sumstats.gz")
+missing_rows$X2 = paste0(missing_rows$X2, ".sumstats.gz")
+write.table(missing_rows, file = "/rds/user/yg330/hpc-work/pgs_img_2/SSHscript/GWAS_rg_matrix/missing_rows.txt", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE, sep = ",")
+
+# add missing rows
+missing_rows_log = list.files("/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix", pattern = ".log", full.names = TRUE)
+missing_rows_log_name = list.files("/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix", pattern = ".log")
+ldsc_rg_batch_read(missing_rows_log, missing_rows_log_name)
+
+missing_row_table = mget(missing_rows_log_name) %>% reduce(full_join)
+missing_row_table$file = "missing_rg_pair.log"
+
+merged_rg_data = fread("/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix/merged_rg_pairs.txt", drop = c(1,2))
+
+merged_rg_data.QCed = full_join(merged_rg_data, missing_row_table)
+
+# Format table and save
+merged_rg_data.QCed.formatted = merged_rg_data.QCed %>% select(-c(p1, p2)) %>% relocate(p1_base, p2_base)
+write.table(merged_rg_data.QCed.formatted, file = "/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix/rg_matrix.QCed.formatted.txt", 
+            row.names = FALSE, quote = FALSE)
+```
+```{r rg matrix generation}
+# merge phenotype and genotype to generate a heatmap matrix
+
+# read in formatted matrix
+rg_matrix = fread("/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix/rg_matrix.QCed.formatted.txt")
+# Create matrix
+all_pheno <- unique(c(rg_matrix$p1_base, rg_matrix$p2_base)) # find all phenotype
+
+
+
+# Create empty rg matrix with phenotype names
+corr_matrix <- matrix(NA, nrow = length(all_pheno), ncol = length(all_pheno))
+rownames(corr_matrix) <- all_pheno
+colnames(corr_matrix) <- all_pheno
+  
+# Diagonal is always 1 (correlation of trait with itself)
+diag(corr_matrix) <- 1
+  
+# Fill the matrix with rg values
+for (i in 1:nrow(rg_matrix)) {
+  # Get the row data
+  row_data = rg_matrix[i, ]
+  pheno1 = row_data$p1_base
+  pheno2 = row_data$p2_base
+    
+  # Set correlation values in both directions
+  corr_matrix[pheno1, pheno2] <- row_data$rg
+  corr_matrix[pheno2, pheno1] <- row_data$rg
+}
+
+# save as Rdata as checkpoint
+saveRDS(corr_matrix, file = "/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix/rg_matrix.rds")
+
+
+
+# Create rg p-val matrix with phenotype names
+pval_rg_matrix <- matrix(NA, nrow = length(all_pheno), ncol = length(all_pheno))
+rownames(pval_rg_matrix) <- all_pheno
+colnames(pval_rg_matrix) <- all_pheno
+
+# Diagonal is always 0 (self-correlation is always significant)
+diag(pval_rg_matrix) <- 0
+
+# Fill the matrix with rg p-val
+for (i in 1:nrow(rg_matrix)) {
+    # Get the row data
+    row_data <- rg_matrix[i, ]
+    pheno1 <- row_data$p1_base
+    pheno2 <- row_data$p2_base
+    
+    # Set p-values in both directions
+    pval_rg_matrix[pheno1, pheno2] <- row_data$p
+    pval_rg_matrix[pheno2, pheno1] <- row_data$p
+}
+
+# save as Rdata as checkpoint
+saveRDS(pval_rg_matrix, file = "/rds/user/yg330/hpc-work/pgs_img_2/result_supplement/GWAS_rg_matrix/pval_rg_matrix.rds")
+
+
+```
