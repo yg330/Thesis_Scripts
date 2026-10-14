@@ -81,19 +81,6 @@ source(here("script_manuscript/slurm_scheduler.R"))
 # ldsc h2 and sumstat only includes autosomal HapMap3 SNP list I believe so the numbers for these files for UKB before and after adding X chromosome should not change.
 # I also did check the rg between UKB_all and UKB_auto and it returned rg as 1 so I'm quite confident this is the case.
 ```
-```{r template for master path update, eval=FALSE, include=FALSE}
-UKB_manhattan = list.files(here("meta_MRI_post_GWAS/UKB_manhattan"), full.names = TRUE)
-UKB_p_1e03.df = data.frame(GWAS_name = basename(UKB_manhattan), UKB_all_GWAS_path.P1e03 = UKB_manhattan)
-UKB_p_1e03.df$GWAS_name = gsub("combined_GWAS_|DTI_|STR_|.p_1e_03.txt|_avg_scaled|X", "", UKB_p_1e03.df$GWAS_name)
-UKB_p_1e03.df$GWAS_name = gsub("SubCorVol", "SubCor_Vol", UKB_p_1e03.df$GWAS_name)
-UKB_p_1e03.df$GWAS_name = gsub("CC_", "CC.", UKB_p_1e03.df$GWAS_name)
-UKB_p_1e03.df$GWAS_name = gsub("_l", ".l", UKB_p_1e03.df$GWAS_name)
-UKB_p_1e03.df$GWAS_name = gsub("_r", ".r", UKB_p_1e03.df$GWAS_name)
-UKB_p_1e03.df$GWAS_name = gsub("Mid_", "Mid.", UKB_p_1e03.df$GWAS_name)
-
-test = full_join(master_path_file,UKB_p_1e03.df)
-write.table(test, here("script_manuscript/master_GWAS_file_path.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
-```
 ```{r Function: ldsc batch read h2 log}
 ldsc_h2_batch_read <- function(file_paths, file_names=NULL) {
   # Initialize an empty list to store results
@@ -928,6 +915,8 @@ SNP2023_vs_2026_concordance %>% summarise(
   no  = sum(!any_overlap, na.rm = TRUE)
 )
 ```
+unique loci was further clumped and filtered under Supervisor's suggestion in bash.
+
 ## Supplement table 7: rg against previous and external GWAS
 ```{r rg against previous and external GWAS: vw2023, subcortical volume, tract}
 rg_comparison.name = list.files(here("script_manuscript/rg_UKB_vs_past_MRI"), pattern = ".log")
@@ -1084,7 +1073,7 @@ ggsave(
 ```
 ```{r Generation of Specificity and Pleitropic Rankings}
 entropy <- function(x, n_max) {
-  p <- table(x) / length(x)
+  p = table(x) / length(x)
   round((-sum(p * log(p))) / log(n_max), 3)
 }
 
@@ -1335,7 +1324,7 @@ rg_node = fread(here("result_manuscript/ST3_UKB_and_meta_h2.txt")) %>%
 rg_network = graph_from_data_frame(d = rg_edge, vertices = rg_node, directed = FALSE)
 saveRDS(rg_network, here("script_manuscript/network_clustering_component/rg_network.Rds"))
 ```
-```{r leiden clustering and investigation on key network properties}
+```{r leiden clustering and hierarchical clustering}
 # leiden clustering
 resolutions = seq(0.1, 2, by = 0.05)
 
@@ -1938,7 +1927,7 @@ write.table(SFARI_ORA.results,
 ```
 
 # Section 7: rg with Autism and Autistic Traits
-```{r section 7 specific packages}
+```{r section 7 specific packages and functions}
 # brain visualisation
 library(ggseg)
 library(ggsegGlasser) # cortical
@@ -1948,8 +1937,51 @@ library(TwoSampleMR)
 
 # network
 library(igraph)
-```
+library(broom)
 
+# function for network property extraction
+centrality.extract = function(df, input_value = rg) {
+
+  bind_rows(
+    df %>%
+      group_by(p1_base) %>%
+      cor_test(strength_norm, {{ input_value }}) %>%
+      mutate(centrality = "degree"),
+
+    df %>%
+      group_by(p1_base) %>%
+      cor_test(eigencent_norm, {{ input_value }}) %>%
+      mutate(centrality = "eigen"),
+
+    df %>%
+      group_by(p1_base) %>%
+      cor_test(betweenness_log_norm, {{ input_value }}) %>%
+      mutate(centrality = "betweenness"))
+
+}
+
+# sep by MRI modality
+modality_based_centrality.extract = function(df, input_value = rg) {
+
+  bind_rows(
+    df %>%
+      group_by(p1_base, MRI_pheno) %>%
+      cor_test(strength_norm, {{ input_value }}) %>%
+      mutate(centrality = "degree"),
+
+    df %>%
+      group_by(p1_base, MRI_pheno) %>%
+      cor_test(eigencent_norm, {{ input_value }}) %>%
+      mutate(centrality = "eigen"),
+
+    df %>%
+      group_by(p1_base, MRI_pheno) %>%
+      cor_test(betweenness_log_norm, {{ input_value }}) %>%
+      mutate(centrality = "betweenness"))
+
+}
+
+```
 ## rg visualisation
 ```{r Autistic traits and Autism vs MRI GWAS, eval=FALSE, include=FALSE}
 # AQ
@@ -2098,23 +2130,53 @@ write.table(master_rg.df, here("script_manuscript/genetic_correlation_component/
 ```
 ```{r rg visualisation: Data prep}
 # read in and filter data
-master_rg.df = fread(here("script_manuscript/genetic_correlation_component/master_rg_results.txt"))
+master_rg.df = fread(here("script_manuscript/genetic_correlation_component/master_rg_results.txt")) %>% filter(p1_base != "Autism_Grove")
 
 # non-global region visualisation
 sig.master_rg.df = master_rg.df %>% 
   filter(MRI_scale == "regional") %>% 
   select(p1_base, MRI_scale, MRI_pheno, region, rg, p.idp_adj, p.idp_label, p.exp_adj, p.exp_label) %>%
     mutate(p_label = case_when(!is.na(p.exp_label) ~ "exp_sig", !is.na(p.idp_label) ~ "idp_sig"),
-           p1_base = factor(p1_base, levels = c("AQ_total_score", "SPQ_total_score", 
-                                                "Autism_Grove", "Autism_Daner", 
+           p1_base = factor(p1_base, levels = c("AQ_total_score", "SPQ_total_score", "Autism_Daner", 
                                                 "Autism_Early_Diagnosed", "Autism_Late_Diagnosed")))
 ```
-```{r SF4.1 rg visusalisation: Cortical Brain Regions across all conditions}
+```{r SF4.1 rg visusalisation: Global and Regional Cortical Brain Regions across all conditions}
+# global
+global_p1 = master_rg.df %>%
+  filter(MRI_scale == "global") %>%
+  pull(p1_base) %>%
+  unique()
+
+global_p1.df = master_rg.df %>% 
+  filter(p1_base %in% global_p1 & MRI_scale == "global") %>% 
+  mutate(MRI_pheno = factor(MRI_pheno, levels = MRI_pheno.list),
+         MRI_label = case_when(MRI_pheno %in% DTI_pheno.list ~ "dMRI",
+                               MRI_pheno %in% STR_pheno.list ~ "sMRI"),
+         p1_name = gsub("_", " ", p1_base),
+         p1_name = factor(p1_name, levels = c("AQ total score", "SPQ total score", 
+                                              "Autism Daner", "Autism Early Diagnosed", "Autism Late Diagnosed")))
+
+rg_global_bar_vis = global_p1.df %>%
+  ggplot(aes(x = MRI_pheno, y = rg, color = MRI_label)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_point() +
+  geom_errorbar(aes(ymin = rg - CI, ymax = rg + CI), width = 0.2) +
+  geom_text(aes(label = p.label), vjust = -0.03, size = 4) +
+  scale_color_manual(values = c("sMRI" = "#99000D", "dMRI" = "#2166AC")) +
+  coord_flip() +
+  ylim(-0.3, 0.3) +
+  facet_wrap(~p1_name, scales = "free_y", nrow = 1) +
+  labs(x = NULL, y = expression(r[g])) +
+  theme_pubclean() +
+  guides(color = "none") + 
+  theme(strip.text = element_text(size = 10, face = "bold"))
+
+# regional
 rg_reg_brain_vis = sig.master_rg.df %>%
   ggplot(mapping=aes(fill = rg, color = p_label)) + 
   geom_brain(atlas = glasser(), hemi = "left", view = c("lateral", "medial"), size = 0.2) +
   scale_fill_gradient2(low = "#2166AC", mid = "white", high = "coral",
-                       midpoint = 0, limits = c(-1, 1), na.value = "grey90", name = "rg") +
+                       midpoint = 0, limits = c(-0.5, 0.5), na.value = "grey90", name = "rg") +
   scale_colour_manual(values = c(idp_sig = "black", exp_sig = "red"),na.value = "grey80", name = NULL) +
   facet_grid(MRI_pheno ~ p1_base) +
   theme_void() + 
@@ -2126,7 +2188,7 @@ ggsave(here("result_manuscript/SF4.1_rg_brain_plot.svg"), rg_reg_brain_vis, widt
 ggsave(here("result_manuscript/SF4.1_rg_brain_plot.png"), rg_reg_brain_vis, width = 11, height = 8)
 ggsave(here("result_manuscript/SF4.1_rg_brain_plot.pdf"), rg_reg_brain_vis, width = 11, height = 8)
 ```
-```{r F4.3.x significant results}
+```{r F4.3.9 significant results}
 # Bar plot panel A
 sig_global_p1 = master_rg.df %>%
   filter(MRI_scale == "global", p < 0.05) %>%
@@ -2184,37 +2246,176 @@ ggsave(here("result_manuscript/F4.3.x_rg_sig.regional_plot.png"), rg_sig.reg_bra
 ggsave(here("result_manuscript/F4.3.x_rg_sig.regional_plot.pdf"), rg_sig.reg_brain_vis, width = 14, height = 8)
 ```
 ## Statistical Model for Prediction
-```{r hubness modelling and graph}
+```{r node-level network property extraction vs autism rg}
 # load network and calculate rg magnitude
 rg_network = readRDS(here("script_manuscript/network_clustering_component/rg_network.Rds"))
 E(rg_network)$abs_rg = abs(E(rg_network)$rg)
 
-# investigate network properties: Strength, eigenvector centrality, betweenness centrality
+# investigate network properties: degree centrality, eigenvector centrality, betweenness centrality
 net_prop.df = tibble(GWAS_name = V(rg_network)$name, 
-                     strength = strength(rg_network, weights = E(rg_network)$abs_rg),
+                     strength = strength(rg_network, weights = E(rg_network)$rg),
                      eigencent = eigen_centrality(rg_network, weights = E(rg_network)$abs_rg)$vector,
                      betweenness = betweenness(rg_network, weights = 1 / E(rg_network)$abs_rg, normalized = TRUE))
 
-asd_rg.df = master_rg.df %>% 
-  filter(p1_base %in% c("Autism_Early_Diagnosed", "Autism_Late_Diagnosed")) %>% # select latent Autism GWAS
+net_prop.df = net_prop.df %>%
+  mutate(betweenness_log = if_else(betweenness > 0,
+                                   log10(betweenness),
+                                   log10(min(net_prop.df$betweenness[net_prop.df$betweenness > 0], na.rm = TRUE) / 2)))
+
+# read in rg data and merge with network data
+rg.df = master_rg.df %>%
+  filter(p1_base != "Autism_Grove") %>% # remove not used data
   mutate(GWAS_name = paste(MRI_scale, MRI_pheno, region, sep = "_"),
          GWAS_name = gsub("_NA", "", GWAS_name))
 
-asd_net.df = as.data.table(left_join(asd_rg.df, net_prop.df, by = "GWAS_name")) %>% 
-  select(p1_base, GWAS_name, MRI_scale, MRI_pheno, region, rg, p, strength, eigencent, betweenness)
+net.df = as.data.table(left_join(rg.df, net_prop.df, by = "GWAS_name")) %>% 
+  select(p1_base, GWAS_name, MRI_scale, MRI_pheno, region, rg, p, p.idp_label, strength, eigencent, betweenness, betweenness_log) %>%
+  mutate(p_neglog = -log10(p),
+         strength_norm = scale(strength),
+         eigencent_norm = scale(eigencent),
+         betweenness_log_norm = scale(betweenness_log),
+         p1_base = factor(p1_base, levels = c("AQ_total_score", "SPQ_total_score", 
+                                              "Autism_Daner", "Autism_Early_Diagnosed", "Autism_Late_Diagnosed")))
 
-ggplot(asd_net.df, aes(strength, p)) +
-  geom_point(alpha = 0.2) +
-  geom_smooth(method = "lm") +
-  facet_wrap(~p1_base)
+net.df.centrality = centrality.extract(net.df)
+sig.net.df.centrality = net.df.centrality %>% mutate(p.adj = p.adjust(p, method = "fdr")) %>% filter(p.adj < 0.05)
+```
+```{r Recalculation of Modality-based hubness score}
+# write temp function for network property extraction from subnetwork
+get_sub_prop = function(m) {
+  sub = induced_subgraph(rg_network, V(rg_network)[MRI_pheno == m])
+  w = E(sub)$abs_rg
+  
+  df = tibble(MRI_pheno = m,
+              GWAS_name = V(sub)$name,
+              strength = strength(sub, weights = E(sub)$rg),
+              eigencent = eigen_centrality(sub, weights = w)$vector,
+              betweenness = betweenness(sub, weights = 1 / w, normalized = TRUE))
+  
+  # floor for zero betweenness is set within each subnetwork
+  nz = df$betweenness[df$betweenness > 0]
+  floor_val = if (length(nz) > 0) min(nz) / 2 else NA_real_
+  df %>% mutate(betweenness_log = if_else(betweenness > 0, log10(betweenness), log10(floor_val)))}
 
-ggplot(asd_net.df, aes(eigencent, p)) +
-  geom_point(alpha = 0.2) +
-  geom_smooth(method = "lm") +
-  facet_wrap(~p1_base)
+net.df_split = map_dfr(MRI_pheno_all, get_sub_prop)
 
-ggplot(asd_net.df, aes(-log(betweenness), p)) +
-  geom_point(alpha = 0.2) +
+# scale for comparison
+net.df_split = net.df_split %>%
+  group_by(MRI_pheno) %>%
+  mutate(across(c(strength, eigencent, betweenness_log),
+                ~ as.numeric(scale(.x)), .names = "{.col}_norm")) %>% ungroup()
+
+# Investigate similarities across network
+net.df_split = net.df_split %>% 
+  mutate(GWAS_name_toformat = GWAS_name) %>% 
+  select(!MRI_pheno) %>% 
+  sup_table_formatter(col_name = "GWAS_name_toformat")
+
+## Strength
+hubness_similarity_wide = net.df_split %>%
+  select(MRI_pheno, region, strength_norm) %>%
+  pivot_wider(names_from = MRI_pheno, values_from = strength_norm) %>% select(!Vol) %>% drop_na()
+
+sim_mat.degree = cor(hubness_similarity_wide %>% select(-region),
+              method = "spearman", use = "pairwise.complete.obs")
+
+heatmap(sim_mat.degree, symm = TRUE) 
+
+## Eigencent
+hubness_similarity_wide = net.df_split %>%
+  select(MRI_pheno, region, eigencent_norm) %>%
+  pivot_wider(names_from = MRI_pheno, values_from = eigencent_norm) %>% select(!Vol) %>% drop_na()
+
+sim_mat.eigencent = cor(hubness_similarity_wide %>% select(-region),
+              method = "spearman", use = "pairwise.complete.obs")
+
+heatmap(sim_mat.eigencent, symm = TRUE) 
+
+## Betweenness
+hubness_similarity_wide = net.df_split %>%
+  select(MRI_pheno, region, betweenness_log_norm) %>%
+  pivot_wider(names_from = MRI_pheno, values_from = betweenness_log_norm) %>% select(!Vol) %>% drop_na()
+
+sim_mat.betweenness = cor(hubness_similarity_wide %>% select(-region),
+              method = "spearman", use = "pairwise.complete.obs")
+
+heatmap(sim_mat.betweenness, symm = TRUE) 
+
+# similarity test
+cor(net.df_split$strength_norm, net.df_split$eigencent_norm, method = "spearman") # 0.9966343
+cor(net.df_split$strength_norm, net.df_split$betweenness_log_norm, method = "spearman") # 0.2823218
+```
+```{r F4.3.10 Full Network Property Results}
+# Autism vs Autistic Traits
+ strength.vis = ggplot(net.df, aes(strength_norm, rg)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = subset(net.df, !is.na(p.idp_label)), color = "red", alpha = 0.5) +
   geom_smooth(method = "lm") +
-  facet_wrap(~p1_base)
+  facet_wrap(~ p1_base, nrow = 1) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+  labs(x = "Degree Centrality") + 
+  theme_pubclean()
+ 
+eigen.vis =  ggplot(net.df, aes(eigencent_norm, rg)) +
+       geom_point(alpha = 0.05) +
+       geom_point(data = subset(net.df, !is.na(p.idp_label)),
+                  color = "red", alpha = 0.5) +
+       geom_smooth(method = "lm") +
+       facet_wrap(~ p1_base, nrow = 1) +
+       stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+       labs(x = "Eigenvector Centrality") + 
+       theme_pubclean()
+
+betweenness.vis =  ggplot(net.df, aes(betweenness_log_norm, rg)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = subset(net.df, !is.na(p.idp_label)), color = "red", alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ p1_base, nrow = 1) +
+  labs(x = "Betweenness Centrality") + 
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+  theme_pubclean()
+
+Figure_4.3.10 = (strength.vis / eigen.vis / betweenness.vis) + plot_annotation(tag_levels = "A")
+
+ggasve("F4.3.10.pdf", plot = Figure_4.3.10, width = 15, height = 14, dpi = 300, units = "in")
+ggasve("F4.3.10.png", plot = Figure_4.3.10, width = 15, height = 14, dpi = 300, units = "in")
+```
+```{r F4.3.11 centrality score per modality}
+asd_net.df_split = rg.df %>%
+  mutate(p1_base = as.character(p1_base),
+         abs_rg = abs(rg),
+         p_neglog = -log10(p)) %>%
+  left_join(net.df_split, by = c("GWAS_name", "MRI_pheno", "MRI_scale", "region")) %>%
+  select(p1_base, GWAS_name, MRI_pheno, MRI_scale, region, 
+         rg, abs_rg, 
+         p, p_neglog, p.idp_label,
+         strength, eigencent, betweenness, betweenness_log,
+         strength_norm, eigencent_norm, betweenness_log_norm) %>%
+  filter(MRI_pheno != "Vol") %>%
+  mutate(p1_base = factor(p1_base, levels = c("AQ_total_score", "SPQ_total_score", 
+                                              "Autism_Daner", "Autism_Early_Diagnosed", "Autism_Late_Diagnosed")))
+
+# extract regression numbers
+modality_net.df.centrality = modality_based_centrality.extract(asd_net.df_split)
+sig.modality_net.df.centrality = modality_net.df.centrality %>% mutate(p.adj = p.adjust(p, method = "fdr")) %>% filter(p.adj < 0.05)
+
+# extract only CT, OD and ICVF for visualization
+asd_net.df_split.vis = asd_net.df_split %>% 
+  filter(MRI_pheno %in% c("CT", "ICVF", "OD", "GMV")) %>% 
+  mutate(MRI_pheno = factor(MRI_pheno, levels = c("CT", "ICVF", "OD", "GMV")))
+
+modality_degree_centrality = ggplot(asd_net.df_split.vis, aes(strength_norm, rg)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = subset(asd_net.df_split.vis, !is.na(p.idp_label)),
+             color = "red", alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ MRI_pheno + p1_base, ncol = 5) +
+  labs(x = "Degree Centrality") + 
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+  theme_pubclean() +
+  scale_x_continuous(breaks = c(-4, -2, 0, 2)) +
+  theme(panel.spacing.x = unit(1, "lines"))
+
+ggsave("F4.3.11.png", modality_degree_centrality, width = 15, height = 12, dpi = 300, units = "in")
+ggsave("F4.3.11.pdf", modality_degree_centrality, width = 15, height = 12, dpi = 300, units = "in")
 ```
