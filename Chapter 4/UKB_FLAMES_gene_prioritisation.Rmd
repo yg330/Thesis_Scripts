@@ -1,0 +1,375 @@
+# Gene prioritisation through FLAMES
+
+IMPORTANT NOTE. FLAMES OUTPUT from FLAMES.py FLAMES are two files named FMALES_scores.pred and FLAMES_scores.raw, their -o argument DO NOT accept any sort of renaming. They only accept -o as a directory folder path. Therefore, if you're doing more than 1 phenotype in batch/parcellation/hpc slurm, YOU WILL NEED to make sure all results are in different folders. I've updated my code pipeline to reflect that.
+
+
+Note. The requirement input for PoPs (step 3) can change depending on what your intended subsequent analyses are. (--num_feature_chunks 99 for naive, other 116)
+
+If your intention is to run pathway-based GO analysis later: Then it is recommended to only run pathway-naive FLAMES, the exact reasoning is documented in the original FLAMES article: 
+
+"Performing pathway analysis on the FLAMES prioritized genes might increase false positives, as the presence of these pathways in the PoPS features used by FLAMES would introduce circularity. We therefore reran FLAMES using PoPS generated from all nonpathway based features (Supplementary Table 13). Pathway-naive FLAMES only marginally underperforms FLAMES with pathway information (Extended Data Fig. 8). SYNGO and MSigDB gene ontology (GO) enrichment analysis was performed in a logistic regression framework, where we tested geneset enrichment of the 178 pathway-naive FLAMES prioritized genes, conditional on genes with high brain expression (ref 20,21)."
+
+
+Note. To my knowledge so far from the FLAMES code and documentation, if you want to use a gene annotation file for magma that is generated later than 2021 (which is when they generated the magma_0kb.genes.annot file from their website, NOT provided in any of their github page), you're likely going to need to re-run all the PoPS generated annotation data (Ex. pops_features_pathway_naive), with the exact features used in FLAMES. I personally do not recommend this route, as I've tested somewhat, and it seems costly and VERY VERY CONFUSING. If anyone brave enough want to have a go, I believe the features you'll need are located in here: "~/rds-genetics_hpc-Nl99R8pHODQ/toolbox/FLAMES/FLAMES_annotation_data/Annotation_data".
+
+If you insist on using the newest gene loc annotation, there are workaround towards this problem, which is detailed in the notes in Step 1a.
+
+
+# Step 0: Create environment for FLAMES to run
+Note. This will include environment requirement that is required for PoPS so no more environment modification is needed.
+
+Note. It is not recommend to go to the FLAMES folder and run "conda env create --file environment.yml", as it takes an awful amount of time (I tried for 2+ hours and failed). Instead use micromamba. Code used to establish environment is as below:
+
+```{bash microconda installation, eval=FALSE, include=FALSE}
+# change directory to your hpc-work software folder (a good practice to have one): In other words, change this - /rds/user/yg330/hpc-work/software_environments
+cd /rds/user/yg330/hpc-work/software_environments
+curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+mkdir -p micromamba
+./bin/micromamba shell init -s bash -r /rds/user/yg330/hpc-work/software_environments/micromamba
+```
+
+```{bash create FLAMES environment, eval=FALSE, include=FALSE}
+./bin/micromamba env create -f {$USER_PATH}/rds-genetics_hpc-Nl99R8pHODQ/toolbox/FLAMES/FLAMES/environment.yml
+```
+
+
+# Step 1: MAGMA to get Z score, and subsequently MAGMA tissue
+!!! Note. For code used in this part please refer to FLAMES_step1_magma_and_magma_tissue.R and .sh. !!!
+
+Note. When running magma for this step, DO NOT FOLLOW THE SUGGESTION ON GITHUB README PAGE, DO NOT DOWNLOAD THE OFFICIAL MAGMA GENE LOC FILE.
+
+This will create problem for PoPS at step 3, not allowing you to proceed further to step 4, as PoPS is not made to handle the most updated gene loc file that we've downloaded to our toolbox/magma (ENSG.gene.loc [ENSEMBL] or ncbi37.gene.loc [Entranz]). This is a known issue, suggested by the multiple unresolved  entries in their Github Issue page. DO NOT FOLLOW THE SOLUTION PROVIDED BY THE GITHUB ISSUE PAGE, THE PoPS CONTRIBUTORS HAVE STOPPED REPLYING SINCE 2021 - Meaning all solutions provided thereafter are most likely a workaround provided by the users, not the coders.
+
+Instead, the most official solution I can provide is to download the gene annotation file that they've provided in their lab website: https://www.finucanelab.org/data 
+
+[PoPS gene prioritization results in 113 complex traits -> Full Results -> Public_PoPS_data -> magma_0kb.genes.annot]
+
+I renamed the downloaded file as 16_Feb_2021_magma_0kb.genes.annot to reflect when they were generated, and you can find it in the FLAMES folder in the toolbox.
+
+Additionally I've also downloaded the gene_loc.txt file, and also renamed it as 16_Feb_2021_gene_loc.txt.
+
+Both files are what we're going to use for the FLAMES instead of the files we've already got in the toolbox/magma.
+
+
+Note. If you still want to attempt to try to update, a credible workaround solution provided by Amir is to use NCBI37.3.gene.loc.extendedMHCexcluded, which you can find here: https://github.com/Integrative-Mental-Health-Lab/linking_cell_types_to_brain_phenotypes
+
+All you need to do is an inner join with the POPS annotation file — then you’re basically running MAGMA on the same genes as POPS. Hopefully, the NCBI version doesn’t make a difference at this point. MHC excluded doesn't affect the running of FLAMES because PoPS just exclude this region by default looking through their verbose log.
+
+But again, as the gene loc is different from the original one generated during 2021 (some split off into 2 genes, some merged into 1, etc.), it is not thoroughly tested on my end what effect it will bring to the subsequent FLAME annotation. But this solution did work (as in a result file is generated).
+
+# Step 2. Run naive PoPS on the generated MAGMA z-scores.
+Note. For code used in this part please refer to FLAMES_step2_naive_pops.R and .sh.
+
+Note. PoPs (Polygenic Priority Score) is in the toolbox folder as pops
+
+Note. --verbose mentioned X and Y training, it does not mean X or Y chromosome, but dimensions. The PoPS do not include sex chromosomes, or HLA regions.
+
+Note on slurm optimisation. The time cost is roughly 10-50 mins per run, the minimum requirement is about 18GB. It is not multi-thread compatible.
+
+# Step 3a. Run Finemapping (Ex. FINEMAP, SUSIE, ABF, etc.) to generate a 95% credible set for FLAMES annotate to refer to
+Note. For code used in this part please refer to FLAMES_step3_naive_pops.R and .sh.
+
+Note. We used coloc package, instead of the assumed susieR package, as they also support single trait finemapping of both abf and susie with less formatting.
+The list of significant locus per trait that is ready to be finemapped is generated from code illustrated in genetic_colocalisation_edited_v2.R
+
+Note. Again, FLAMES expect the column format in very specific way (tab-separated, etc.), and will throw error if you deviate from the expected example format, I figured out from trial and error that it expects:
+
+FLAMES.py annotate argument (that they didn't explain what it is about on the github):
+-pc prob1 <- PIP column name expected for the credible set file
+-sc cred1 <- credible set SNP column name expected for the credible set file
+
+# Step 3b. Run FLAMES to annotate and score
+Note. For us we'll need to generate a customise genomic locus file. In this scenario we used the following definition:
+
+This LD_block information is used to generate every locus-based files, with the following information:
+LD blocks: downloaded from mapgen package here - https://github.com/xinhe-lab/mapgen/blob/main/inst/extdata/LD.blocks.EUR.hg19.rds
+They're generated from:  1000 Genomes (1KG) European population (in hg19)
+!! Note. Only autosomal regions are considered !!
+
+```{r Generate a customise genomic locus file to ensure FLAMES consistency with abf finemapping results, eval=FALSE, include=FALSE}
+out_dir = "/rds/user/yg330/hpc-work/pgs_img_2/SSHscript/GWAS_FLAME/step5_FLAMES_annotate/"
+
+# reformat as requested
+LD_Blocks <- readRDS("/rds/user/yg330/hpc-work/pgs_img_2/Rscript/LD.blocks.EUR.hg19.rds") %>%
+  mutate(
+    chr = as.integer(chr),
+    start = as.integer(start),
+    end = as.integer(end)
+  ) %>% rename(GenomicLocus = locus) %>% select(GenomicLocus, chr, start, end)
+
+locus_defination = paste0(out_dir, "LD_block_formatted.txt")
+write.table(LD_Blocks, locus_defination, row.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+Note. DO NOT TRY TO RUN FLAMES AS IT IS LOCALLY OR ON HPC, by default FLAMES queue jobs online using VEP API, which results in the following:
+
+For each variant in credible set:
+    → Send HTTP request to Ensembl
+    → Wait for response
+    → Parse result
+    → Move to next variant
+
+This means you will wait for more than 10 min per locus depending on the remote vep server's current job limits/status/queue-length/etc.
+Instead, try to use the ensembl-vep already existed in our toolbox: ~/rds-genetics_hpc-Nl99R8pHODQ/toolbox/ensembl-vep
+
+Manual set up for GRCH37 needed as we originally only have GRCH38 version of homo sapian cache data for vep, log I did to solve this problems is as shown below:
+```{bash vep cache and CADD tabix set up, eval=FALSE, include=FALSE}
+# This is a log on how to set up the VEP cache and tabix CADD scores, VEP we have in the toolbox is version 113, therefore we need to download v113 Grch37 cache
+# If you want you can try to update the vep inside our toolbox to the latest version, but you'll also need to also download and update the corresponding caches.
+
+# for VEP cache:
+cd /rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/toolbox/ensembl-vep
+./INSTALL.pl -a c -s homo_sapiens -y GRCh37 -c . --CACHE_VERSION 113
+
+# for tabixed CADD scores: Will take about 5-10 hours depending on internet stability. I throw it on sbatch for it to run while working.
+wget -c https://krishna.gs.washington.edu/download/CADD/v1.6/GRCh37/whole_genome_SNVs.tsv.gz # this is the large one
+wget -c https://krishna.gs.washington.edu/download/CADD/v1.6/GRCh37/whole_genome_SNVs.tsv.gz.tbi
+```
+
+Note. You can ignore Warnings during execution of FLAMES/annotate.py as it is a known problem indicating that deletions are not being successfully applied to VEP annotation.
+
+Update Note on previous point. From pull request (Oct 2025), we can also see that FLAMES now finally can accept Insertion/deletion (InDel) CADD scores, not only SNV CADD scores. If you're interested in re-running the FLAMES result with InDel, you should also download the CADD score for InDels.
+
+# In case on how to find and set reruns in case not all traits/GWAS successfully ran:
+Note. From what I've seen for step 1 and 2 it's mostly related with resource assignment. Step 3 may have more variation of why ERROR happened.
+
+Note. For step 1.magma_and_magma_tissue, you can check if there is any file unfinished using the following example code:
+```{r find unfinished step1 in case not finished, eval=FALSE, include=FALSE}
+test = list.files("/rds/user/yg330/hpc-work/pgs_img_2/SSHscript/GWAS_FLAME/FLAMES_pipeline_v2/step1_magma_and_magma_tissue", full.names = TRUE)
+test.unfinished = test[sapply(test, file.size) < 15000] # for getting files that are smaller than 15KB (which is the minimum size if everything is finished)
+
+# Rerun with longer time and all is now finished.
+```
+
+Note. For step2.naive_pops, you can check if tere is any file unfinished using the following example code:
+```{r find unfinished step 2 in case not finished, eval=FALSE, include=FALSE}
+test <- list.files("/rds/user/yg330/hpc-work/pgs_img_2/SSHscript/GWAS_FLAME/FLAMES_pipeline_v2/step2_naive_pops", full.names = TRUE)
+
+test.unfinished = test[!sapply(test, function(f) {
+  any(grepl("INFO: Writing output files.", readLines(f, warn = FALSE), fixed = TRUE))
+})]
+
+array_id_rerun = as.numeric(sub(".*_(\\d+)\\.log$", "\\1", test.unfinished))
+array_id_rerun.string = paste(array_id_rerun, collapse = ",") # this is what you slap into the slurm -a for rerun.
+
+# Rerun with longer time and all is now finished.
+```
+
+Note. For step3_FLAMES, you can check if any file is unfinished using the following example code:
+```{r find unfinished step 3 in case not finished, eval=FALSE, include=FALSE}
+test <- list.files("/rds/user/yg330/hpc-work/pgs_img_2/SSHscript/GWAS_FLAME/FLAMES_pipeline_v2/step3_abf_to_FLAMES", full.names = TRUE)
+
+test.unfinished = test[!sapply(test, function(f) {
+  any(grepl("output written to ", readLines(f, warn = FALSE), fixed = TRUE))
+})] # find subset that FLAMES didn't generate output.
+
+test.not_no_sig_locus = test.unfinished[!sapply(test.unfinished, function(f) {
+  any(grepl("arguments imply differing number of rows: 0, 1", readLines(f, warn = FALSE), fixed = TRUE))
+})] # find subset that failed because of reasons other than no sig.SNP passed EWS-level p threshold. 
+# -> Note. character(empty) means every failure was because abf is empty.
+```
+
+# Step 6. Compile everything in table
+```{r generate FLAMES master result sheet}
+FLAMES.results = list.files("/rds/user/yg330/rds-genetics_hpc-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/UKB_FLAMES", 
+                            pattern = "FLAMES_scores", full.names = TRUE, recursive = TRUE)
+
+# For full non-0% FLAMES gene list:
+FLAMES.score.raw = grep(".raw", FLAMES.results, value = TRUE)
+
+FLAMES.score.raw.df = map_dfr(FLAMES.score.raw, function(file) {
+  fread(file) %>%
+    filter(estimated_cumulative_precision > 0) %>%
+    mutate(source_file = basename(dirname(file)))
+})
+
+# For 75% credible prioritised gene list:
+FLAMES.score.pred = grep(".pred", FLAMES.results, value = TRUE)
+
+FLAMES.score.pred.df = map_dfr(FLAMES.score.pred, function(file) {
+  df = fread(file)
+  
+  if (nrow(df) == 0) {
+    message("Skipping due to <75% cumulative precision: ", basename(dirname(file)))
+    return(NULL)
+  }
+  
+  df %>%
+    mutate(source_file = basename(dirname(file)))
+})
+
+# Save unformatted results:
+write.table(FLAMES.score.raw.df, 
+            "/rds/project/rds-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/supplement_results/master_FLAMES.raw_results.txt")
+write.table(FLAMES.score.pred.df, 
+            "/rds/project/rds-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/supplement_results/master_FLAMES.pred_results.txt")
+
+# Save supplement results:
+FLAMES.score.pred.df.formatted = FLAMES.score.pred.df %>% 
+  rename(phenotype = source_file) %>% 
+  select(phenotype, symbol, ensg, FLAMES_scaled, estimated_cumulative_precision)
+
+write.table(FLAMES.score.pred.df.formatted, 
+            "/rds/project/rds-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/supplement_results/STX_FLAMES_gene_prioritisation_results.txt",
+            quote = FALSE, row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Step 7. Preliminary analysis
+```{r}
+FLAMES = fread("/rds/project/rds-Nl99R8pHODQ/UKB/Imaging_genetics/yg330/meta_MRI_post_GWAS/supplement_results/STX_FLAMES_gene_prioritisation_results.txt")
+
+# How many unique genes prioritised across 2000 traits?
+# What are the genes that are most frequently mentioned?
+# What genes affect most traits? Are there any tract/sub cortical/pheno-specific genes? What genes are unique to the 1 traits?
+```
+
+```{r}
+df = FLAMES
+
+df <- df %>%
+  mutate(
+    phenotype_clean = phenotype %>%
+      str_remove("^global_") %>%
+      str_remove("^regional_"),
+    
+    phenotype_type = case_when(
+      # Tract phenotypes: tract_FA_ifo.l → FA
+      str_detect(phenotype_clean, "^tract_") ~
+        str_extract(phenotype_clean, "(?<=^tract_)[A-Za-z0-9]+"),
+      
+      # All other phenotypes: take first token
+      TRUE ~ str_split(phenotype_clean, "_") %>% map_chr(1)
+    )
+  )
+
+
+# -------------------------------
+# 3. List of genes by phenotype
+# -------------------------------
+
+genes_by_phenotype <- df %>%
+  distinct(symbol, phenotype_type) %>%
+  group_by(phenotype_type) %>%
+  summarise(
+    genes = list(sort(unique(symbol))),
+    n_genes = n_distinct(symbol),
+    .groups = "drop"
+  )
+
+# genes_by_phenotype$genes is a named list of gene vectors
+
+unique_genes_by_phenotype <- genes_by_phenotype %>%
+  rowwise() %>%
+  mutate(
+    unique_genes = list(
+      setdiff(
+        genes,
+        unlist(
+          genes_by_phenotype$genes[
+            genes_by_phenotype$phenotype_type != phenotype_type
+          ]
+        )
+      )
+    ),
+    n_unique = length(unique_genes)
+  ) %>%
+  ungroup() %>%
+  select(phenotype_type, unique_genes, n_unique)
+
+# -------------------------------
+# 5. Gene–phenotype overlap table
+# -------------------------------
+
+gene_phenotype_map <- df %>%
+  distinct(symbol, phenotype_type) %>%
+  group_by(symbol) %>%
+  summarise(
+    phenotypes = list(sort(unique(phenotype_type))),
+    n_phenotypes = n_distinct(phenotype_type),
+    .groups = "drop"
+  )
+
+# -------------------------------
+# 6. Overlapping genes by degree
+#    (2, 3, 4, 5+ phenotypes)
+# -------------------------------
+
+overlap_2plus <- gene_phenotype_map %>% filter(n_phenotypes >= 2)
+overlap_3plus <- gene_phenotype_map %>% filter(n_phenotypes >= 3)
+overlap_4plus <- gene_phenotype_map %>% filter(n_phenotypes >= 4)
+overlap_5plus <- gene_phenotype_map %>% filter(n_phenotypes >= 5)
+
+# -------------------------------
+# 7. Optional: export tables
+# -------------------------------
+
+write.csv(genes_by_phenotype,
+          "genes_by_phenotype.csv",
+          row.names = FALSE)
+
+write.csv(unique_genes_by_phenotype,
+          "unique_genes_by_phenotype.csv",
+          row.names = FALSE)
+
+write.csv(gene_phenotype_map,
+          "gene_phenotype_overlap_table.csv",
+          row.names = FALSE)
+
+write.csv(overlap_3plus,
+          "genes_overlapping_3plus_phenotypes.csv",
+          row.names = FALSE)
+```
+
+
+# Step 7. SYNGO and MSigDB gene ontology (GO) enrichment analysis
+Note. This is done locally because "clusterProfiler" could not be installed on the HPC due to a compiler incompatibility: its dependency fgsea requires a C++14-compliant toolchain, while the HPC R 4.3.1 environment is configured to compile user packages with C++11 and uses read-only system libraries. Nonetheless code used to generate the results are copied below:
+
+```{r eval=FALSE, include=FALSE}
+# Compare gene cluster similarities
+# Check how tolerate are they towards deviations
+# Read clusterprofiler
+library(msigdbr)
+library(clusterProfiler)
+library(enrichplot)
+
+```
+
+
+
+I wrote this little helper to run the SMR query:
+# Helper to run SMR
+def run_smr(qtl_file: Path, qtl_name: str):
+    besd_path = qtl_file.with_suffix(".besd")
+    if besd_path.exists():
+        print(f"Running SMR on {qtl_name}: {qtl_file}")
+        out_path = out_dir / f"GWAS_{gwas_id}_{snp}_{qtl_name}"
+        cmd = [
+            SMR_Tool,
+            "--beqtl-summary", str(qtl_file),
+            "--query", "5.0e-8",
+            "--snp", snp,
+            "--out", str(out_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+It just checks whether the .besd file exists, then runs SMR with the given SNP and QTL files. Super basic but gets the job done.

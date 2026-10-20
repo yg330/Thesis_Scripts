@@ -2342,8 +2342,8 @@ sim_mat.betweenness = cor(hubness_similarity_wide %>% select(-region),
 heatmap(sim_mat.betweenness, symm = TRUE) 
 
 # similarity test
-cor(net.df_split$strength_norm, net.df_split$eigencent_norm, method = "spearman") # 0.9966343
-cor(net.df_split$strength_norm, net.df_split$betweenness_log_norm, method = "spearman") # 0.2823218
+cor.test(net.df_split$strength_norm, net.df_split$eigencent_norm, method = "spearman") # 0.9966343
+cor.test(net.df_split$strength_norm, net.df_split$betweenness_log_norm, method = "spearman") # 0.2823218
 ```
 ```{r F4.3.10 Full Network Property Results}
 # Autism vs Autistic Traits
