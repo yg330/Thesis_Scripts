@@ -7,7 +7,7 @@ For Published/Manuscript version:
 
 The GitHub Location is: https://github.com/yg330/autism.img-pgs
 
-#### Chapter 4: SPQ GWAS 
+#### Chapter 4: SPQ GWAS (In Prep)
 The GitHub Location is: https://github.com/yg330/SPQ_GWAS
 
 #### Chapter 4: Polygenic hierarchies of macroscale brain structural organisation. Gu, Y., Ebneabbasi, A., He, Y. et al. bioRxiv 2026.09.19.752830; doi: https://doi.org/10.64898/2026.09.19.752830
